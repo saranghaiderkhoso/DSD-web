@@ -435,55 +435,32 @@ def stream_command(cmd_key: str):
 # -------------------------------------------------------------------------
 @app.post("/api/simulate")
 def assemble_and_simulate(req: CustomAssembleRequest):
-    work_dir = PROJECT_ROOT / "build" / "studio_sim"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    asm_file = work_dir / "studio_prog.asm"
-    hex_file = work_dir / "studio_prog.hex"
-    lst_file = work_dir / "studio_prog.lst"
-    gold_trace = work_dir / "gold.trace"
-    state_json = work_dir / "state.json"
-
-    asm_file.write_text(req.asm_code, encoding="utf-8")
-
-    # 1. Run Two-Pass Assembler (uses sys.executable for Windows + Linux compatibility)
-    asm_cmd = [
-        sys.executable, "tools/dsd8asm.py",
-        str(asm_file), "-o", str(hex_file), "--listing", str(lst_file)
-    ]
-    asm_res = subprocess.run(asm_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
-    if asm_res.returncode != 0:
-        return {"status": "error", "stage": "assembler", "log": asm_res.stderr or asm_res.stdout}
-
-    # 2. Run Golden Simulator (dsd8sim_nn.py or dsd8sim.py)
-    if req.use_nn_sim:
-        sim_cmd = [
-            sys.executable, "tools/dsd8sim_nn.py", str(hex_file),
-            "--trace", str(gold_trace),
-            "--state-out", str(state_json),
-        ]
-    else:
-        sim_cmd = [
-            sys.executable, "tools/dsd8sim.py", str(hex_file),
-            "--trace", str(gold_trace),
-            "--state-out", str(state_json),
-            "--switches", req.switches,
-            "--buttons", req.buttons,
-        ]
-
-    # 3. Parse Golden Trace & Final State
-    steps = parse_trace_file(gold_trace)
-    final_state = json.loads(state_json.read_text()) if state_json.exists() else {}
-    listing_text = lst_file.read_text() if lst_file.exists() else ""
-
-    return {
-        "status": "ok",
-        "listing": listing_text,
-        "final_state": final_state,
-        "total_retired": len(steps),
-        "trace_steps": steps,
-        "log": sim_res.stdout,
-    }
+    try:
+        work_dir = PROJECT_ROOT / "build" / "studio_sim"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        asm_file = work_dir / "studio_prog.asm"
+        hex_file = work_dir / "studio_prog.hex"
+        lst_file = work_dir / "studio_prog.lst"
+        gold_trace = work_dir / "gold.trace"
+        state_json = work_dir / "state.json"
+        asm_file.write_text(req.asm_code, encoding="utf-8")
+        asm_cmd = [sys.executable, "tools/dsd8asm.py", str(asm_file), "-o", str(hex_file), "--listing", str(lst_file)]
+        asm_res = subprocess.run(asm_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+        if asm_res.returncode != 0:
+            return {"status": "error", "stage": "assembler", "log": asm_res.stderr or asm_res.stdout}
+        if req.use_nn_sim:
+            sim_cmd = [sys.executable, "tools/dsd8sim_nn.py", str(hex_file), "--trace", str(gold_trace), "--state-out", str(state_json)]
+        else:
+            sim_cmd = [sys.executable, "tools/dsd8sim.py", str(hex_file), "--trace", str(gold_trace), "--state-out", str(state_json), "--switches", req.switches, "--buttons", req.buttons]
+        sim_res = subprocess.run(sim_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+        if sim_res.returncode != 0:
+            return {"status": "error", "stage": "golden_sim", "log": sim_res.stderr or sim_res.stdout}
+        steps = parse_trace_file(gold_trace)
+        final_state = json.loads(state_json.read_text()) if state_json.exists() else {}
+        listing_text = lst_file.read_text() if lst_file.exists() else ""
+        return {"status": "ok", "listing": listing_text, "final_state": final_state, "total_retired": len(steps), "trace_steps": steps, "log": sim_res.stdout}
+    except Exception as e:
+        return {"status": "error", "stage": "backend_exception", "log": str(e)}
 
 # -------------------------------------------------------------------------
 # API Endpoints: Waveform VCD & NN Benchmark Comparison Data
