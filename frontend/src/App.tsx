@@ -4,7 +4,7 @@ import {
   SkipBack, SkipForward, RotateCcw, Save
 } from "lucide-react";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "";
 
 const DEFAULT_DEMO_ASM = `; DSD-8 + int8 Neural Network Accelerator Demo
         LDI  R0, 0xA5
