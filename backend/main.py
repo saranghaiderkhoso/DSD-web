@@ -470,7 +470,6 @@ def assemble_and_simulate(req: CustomAssembleRequest):
             "--switches", req.switches,
             "--buttons", req.buttons,
         ]
-    sim_res = subprocess.run(sim_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
 
     # 3. Parse Golden Trace & Final State
     steps = parse_trace_file(gold_trace)
