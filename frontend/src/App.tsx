@@ -2,64 +2,49 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import {
   Cpu,
   Play,
-  Pause,
   SkipForward,
   SkipBack,
+  Pause,
   RotateCcw,
   Terminal,
   Activity,
-  BrainCircuit,
+  Layers,
+  Zap,
+  CheckCircle2,
+  XCircle,
   Code2,
   Sliders,
+  Eye,
   Download,
-  FileCode,
-  FileText,
-  Printer,
-  ShieldCheck,
+  FileSpreadsheet,
   Sparkles,
-  ZoomIn,
-  ZoomOut,
-  AlertCircle,
-  CheckCircle,
-  XCircle,
+  ShieldCheck,
+  Radio,
   FastForward,
 } from "lucide-react";
 
 const API_BASE = "";
 
-async function safeFetchJson(url: string, init?: RequestInit) {
-  const res = await fetch(url, init);
-  const rawText = await res.text();
-  let data: any = {};
+async function safeFetchJson(url: string, options?: RequestInit) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  let data: any = null;
   try {
-    data = rawText ? JSON.parse(rawText) : {};
+    data = text ? JSON.parse(text) : {};
   } catch {
     throw new Error(
-      `Server returned non-JSON response (HTTP ${res.status}): ${rawText.slice(0, 200)}`
+      `Server returned non-JSON response (HTTP ${res.status}): ${text.slice(0, 140)}`
     );
   }
   if (!res.ok) {
-    throw new Error(data?.detail || `HTTP ${res.status}: ${rawText.slice(0, 200)}`);
+    throw new Error(data?.detail || data?.error || `HTTP Error ${res.status}`);
   }
   return data;
 }
 
-const DEFAULT_ASM = `; DSD-8 + int8 Neural Network Accelerator Demo
-LDI R0, 0xA5
-OUT 0x5F, R0 ; Unlock NN Accelerator (Port 0x5F = 0xA5)
-LDI R0, 0x03
-OUT 0x52, R0 ; Clear 24-bit accumulator & counters
-LDI R1, 3
-OUT 0x50, R1 ; Latch activation A = 3
-LDI R2, 4
-OUT 0x51, R2 ; Trigger MAC with weight W = 4 (acc += 3*4 = 12)
-IN R3, 0x53  ; Read low accumulator byte (NN_ACC0 = 0x0C)
-OUT 0x02, R3 ; Output 0x0C to board LEDs
-HLT`;
-
-interface DecodedIR {
+interface DecodedInstr {
   opcode: number;
-  mnemonic: string;
+  opcode_hex: string;
   rd: number;
   rs1: number;
   rs2: number;
@@ -67,7 +52,10 @@ interface DecodedIR {
   addr9: string;
   io_dir: number;
   port: string;
-  wb_sel: string | null;
+  disassembly: string;
+  fsm_states: string[];
+  cycles: number;
+  wb_sel: string;
 }
 
 interface TraceStep {
@@ -75,388 +63,434 @@ interface TraceStep {
   pc: string;
   pc_int: number;
   ir: string;
+  ir_int: number;
   rf_we: number;
   rd_addr: number;
   rf_data: string;
+  rf_data_int: number;
   mem_we: number;
   mem_addr: string;
+  mem_addr_int: number;
   mem_data: string;
+  mem_data_int: number;
   flags: string;
-  decoded: DecodedIR;
-}
-
-interface SimState {
-  pc?: number;
-  regs?: number[];
-  flags?: { Z?: number; N?: number; C?: number; V?: number };
-  dmem?: number[];
-  halted?: boolean;
-  leds?: number;
-  seg_value?: number;
-  seg_enable?: number;
-  nn?: {
-    unlocked?: boolean;
-    a?: number;
-    w?: number;
-    acc?: number;
-    shift?: number;
-    qout?: number;
-    lut_sel?: number;
-    act?: number;
-    skip_cnt?: number;
-    mac_cnt?: number;
-  };
+  decoded: DecodedInstr;
 }
 
 interface NNSample {
   index: number;
+  sample_id: string;
   features: number[];
-  label: number;
+  expected_class: number;
   class_name: string;
 }
 
-interface CustomNNResult {
-  features: number[];
-  shift1: number;
-  shift2: number;
-  lut_bank: number;
-  layer1_acc: number[];
-  layer1_qout: number[];
-  layer1_act: number[];
-  layer2_acc: number[];
-  layer2_scores: number[];
-  predicted_class: number;
-  predicted_name: string;
-  mac_count: number;
-  skip_count: number;
-  total_ops: number;
-  sparsity_pct: number;
-  generated_asm: string;
+interface CertifiedMetric {
+  variant: string;
+  title: string;
+  mean_cycles: number;
+  min_cycles: number;
+  max_cycles: number;
+  speedup_b0: number;
+  speedup_b1: number;
+  max_instr: number;
 }
 
-interface WaveformSignal {
+interface VcdSignal {
   id: string;
   name: string;
-  width: number;
+  full_name: string;
   group: string;
-  values: string[];
+  width: number;
+  transitions: { t: number; v: string }[];
 }
 
-interface TestTargetResult {
+interface SuiteResult {
   target: string;
-  name: string;
+  title: string;
   passed: boolean;
-  pass_count: number;
-  fail_count: number;
-  duration_ms: number;
-  log: string;
+  returncode: number;
+  elapsed_sec: number;
+  output: string;
 }
 
-const BENCHMARK_ROWS = [
-  {
-    variant: "b0",
-    desc: "Repeated-Addition Software Multiply",
-    mean: 43155,
-    min: 41637,
-    max: 44678,
-    speedupB0: "1.0x",
-    speedupB1: "0.6x",
-    maxInstr: 388,
-  },
-  {
-    variant: "b1",
-    desc: "Shift-and-Add Software Multiply",
-    mean: 24427,
-    min: 24135,
-    max: 24654,
-    speedupB0: "1.8x",
-    speedupB1: "1.0x",
-    maxInstr: 434,
-  },
-  {
-    variant: "a0",
-    desc: "Looped Hardware MAC + SW Activation (0x57)",
-    mean: 2172,
-    min: 2171,
-    max: 2175,
-    speedupB0: "19.9x",
-    speedupB1: "11.2x",
-    maxInstr: 260,
-  },
-  {
-    variant: "a2",
-    desc: "Looped Hardware MAC + HW LUT (0x59)",
-    mean: 2071,
-    min: 2071,
-    max: 2071,
-    speedupB0: "20.8x",
-    speedupB1: "11.8x",
-    maxInstr: 250,
-  },
-  {
-    variant: "a4",
-    desc: "Fully Unrolled Hardware MAC + HW LUT (0x59)",
-    mean: 1087,
-    min: 1087,
-    max: 1087,
-    speedupB0: "39.7x",
-    speedupB1: "22.5x",
-    maxInstr: 303,
-  },
-];
+const DEFAULT_ASM = `; ============================================================================
+; DSD-8 Studio Demo: ALU + Memory + int8 Neural Accelerator (Ports 0x50-0x5F)
+; ============================================================================
+    LDI R0, 0xA5        ; Load NN_KEY unlock token (0xA5)
+    OUT 0x5F, R0        ; Unlock int8 NN Accelerator
+    LDI R0, 0x03        ; Bit0=Clear Acc, Bit1=Clear Counters
+    OUT 0x52, R0        ; Write NN_CTRL (0x52)
+
+    LDI R1, 0x04        ; Shift amount = 4
+    OUT 0x56, R1        ; Write NN_SHIFT (0x56)
+    LDI R1, 0x00        ; Select LUT Bank 0 (ReLU)
+    OUT 0x58, R1        ; Write NN_LUT_SEL (0x58)
+
+    ; Perform MAC #1: A = 20 (0x14), W = 10 (0x0A) -> +200
+    LDI R2, 0x14
+    OUT 0x50, R2        ; Latch signed int8 activation NN_A
+    LDI R3, 0x0A
+    OUT 0x51, R3        ; Write weight NN_W & trigger 3-stage MAC
+
+    ; Perform MAC #2: A = 12 (0x0C), W = 5 (0x05) -> +60 (Total = 260)
+    LDI R2, 0x0C
+    OUT 0x50, R2
+    LDI R3, 0x05
+    OUT 0x51, R3
+
+    ; Read back requantized & ReLU activated output
+    IN  R4, 0x57        ; Read NN_QOUT (sat8(260 >> 4) = 16 = 0x10)
+    IN  R5, 0x59        ; Read NN_ACT  (ReLU(16) = 0x10)
+    IN  R6, 0x5D        ; Read NN_MACCNT (2 nonzero MACs executed)
+
+    ; Output result to LEDs (0x02) and 7-Segment Display (0x10)
+    OUT 0x02, R5
+    OUT 0x10, R5
+    HLT
+`;
+
+const IO_SWITCH_DEMO_ASM = `; ============================================================================
+; Virtual FPGA Board Switch (0x00) & Button (0x01) -> LED (0x02) & 7-Seg Demo
+; NOTE: Uncheck "NN-Aware Sim" automatically enabled by the button!
+; ============================================================================
+    IN  R1, 0x00        ; Read Slide Switches (Port 0x00) into R1
+    OUT 0x02, R1        ; Drive Board LEDs (Port 0x02) from R1
+    IN  R2, 0x01        ; Read Push Buttons (Port 0x01) into R2
+    OUT 0x10, R2        ; Drive 7-Segment Value (Port 0x10) from R2
+    HLT
+`;
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
-    "cpu" | "datapath" | "waveform" | "nn" | "wizard" | "verify" | "toolchain"
-  >("cpu");
-
+    "ide" | "datapath" | "waveform" | "nn" | "wizard" | "verify"
+  >("ide");
   const [asmCode, setAsmCode] = useState<string>(DEFAULT_ASM);
+  const [programs, setPrograms] = useState<
+    { id: string; name: string; category: string; path: string }[]
+  >([]);
+  const [selectedProgram, setSelectedProgram] = useState<string>("");
   const [useNnSim, setUseNnSim] = useState<boolean>(true);
-  const [switchesVal, setSwitchesVal] = useState<number>(0);
-  const [buttonsVal, setButtonsVal] = useState<number>(0);
+
+  // Virtual FPGA Board Periphery State (Feature 1)
+  const [switchBits, setSwitchBits] = useState<number>(0x00);
+  const [buttonBits, setButtonBits] = useState<number>(0x00);
+
+  // Simulation Artifacts & Trace State
+  const [hexOutput, setHexOutput] = useState<string>("");
+  const [listingOutput, setListingOutput] = useState<string>("");
+  const [rawTraceOutput, setRawTraceOutput] = useState<string>("");
   const [trace, setTrace] = useState<TraceStep[]>([]);
-  const [rawTrace, setRawTrace] = useState<string>("");
-  const [hexCode, setHexCode] = useState<string>("");
-  const [listing, setListing] = useState<string>("");
-  const [finalState, setFinalState] = useState<SimState>({});
+  const [finalState, setFinalState] = useState<any>(null);
   const [stepIdx, setStepIdx] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [playSpeedMs, setPlaySpeedMs] = useState<number>(250);
+  const [playSpeedMs, setPlaySpeedMs] = useState<number>(200);
   const [simError, setSimError] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  const [codeView, setCodeView] = useState<"asm" | "listing" | "hex">("asm");
 
+  // Feature 1: Breakpoints & Register Watchpoints
   const [breakpoints, setBreakpoints] = useState<number[]>([]);
-  const [bpInput, setBpInput] = useState<string>("0x006");
-  const [watchReg, setWatchReg] = useState<number | null>(null);
-  const [debugNotice, setDebugNotice] = useState<string | null>(null);
+  const [watchRegs, setWatchRegs] = useState<number[]>([]);
+  const [watchAlert, setWatchAlert] = useState<string | null>(null);
 
+  // Feature 3: Waveform Viewer State
+  const [vcdData, setVcdData] = useState<{
+    exists: boolean;
+    max_time: number;
+    signals: VcdSignal[];
+  }>({
+    exists: false,
+    max_time: 100,
+    signals: [],
+  });
+  const [waveGroupFilter, setWaveGroupFilter] = useState<
+    "ALL" | "CPU" | "IO" | "NN"
+  >("ALL");
+  const [waveZoom, setWaveZoom] = useState<number>(1);
+  const [isLoadingVcd, setIsLoadingVcd] = useState<boolean>(false);
+
+  // Feature 4: Automated Test Suite State
+  const [suiteResults, setSuiteResults] = useState<Record<string, SuiteResult>>(
+    {}
+  );
+  const [runningTarget, setRunningTarget] = useState<string | null>(null);
+
+  // NN Benchmark State
   const [nnSamples, setNnSamples] = useState<NNSample[]>([]);
-  const [selectedSample, setSelectedSample] = useState<number>(0);
+  const [certifiedMetrics, setCertifiedMetrics] = useState<CertifiedMetric[]>(
+    []
+  );
+  const [benchMarkdown, setBenchMarkdown] = useState<string>("");
+  const [selectedSampleIdx, setSelectedSampleIdx] = useState<number>(0);
   const [selectedVariant, setSelectedVariant] = useState<string>("a4");
-  const [benchMd, setBenchMd] = useState<string>("");
-  const [customFeatures, setCustomFeatures] = useState<number[]>([51, 35, 14, 2]);
+
+  // Feature 5: Custom NN Quantization Wizard State
+  const [customFeatures, setCustomFeatures] = useState<number[]>([
+    -63, 45, -89, -86,
+  ]);
   const [customShift1, setCustomShift1] = useState<number>(7);
   const [customShift2, setCustomShift2] = useState<number>(7);
   const [customLutBank, setCustomLutBank] = useState<number>(0);
-  const [customNnResult, setCustomNnResult] = useState<CustomNNResult | null>(null);
-  const [lutsData, setLutsData] = useState<Record<string, number[]>>({});
+  const [customNnResult, setCustomNnResult] = useState<any>(null);
 
-  const [waveTimestamps, setWaveTimestamps] = useState<number[]>([]);
-  const [waveSignals, setWaveSignals] = useState<WaveformSignal[]>([]);
-  const [waveSource, setWaveSource] = useState<string>("trace_synthesized");
-  const [waveGroupFilter, setWaveGroupFilter] = useState<string>("ALL");
-  const [waveZoom, setWaveZoom] = useState<number>(38);
-
-  const [testResults, setTestResults] = useState<Record<string, TestTargetResult>>({});
-  const [runningTestKey, setRunningTestKey] = useState<string | null>(null);
-
-  const [consoleLines, setConsoleLines] = useState<string[]>([
-    "DSD-8 Studio Ready. Select a verification or build command above.",
+  // SSE Console State
+  const [consoleLogs, setConsoleLogs] = useState<string[]>([
+    "DSD-8 Studio v2.1 initialized. Ready to assemble, simulate, or stream RTL verification.",
   ]);
   const [isRunningCmd, setIsRunningCmd] = useState<boolean>(false);
-  const consoleEndRef = useRef<HTMLDivElement | null>(null);
-
-  const reconstructed = useMemo(() => {
-    const regs = [0, 0, 0, 0, 0, 0, 0, 0];
-    const dmem = new Array(256).fill(0);
-    let flags = "0000";
-    let leds = 0;
-    let segVal = 0;
-    let segEn = 0;
-    let nnUnlocked = false;
-    let nnA = 0;
-    let nnW = 0;
-    let nnAcc = 0;
-    let nnShift = 0;
-    let nnLutSel = 0;
-    let nnSkipCnt = 0;
-    let nnMacCnt = 0;
-
-    const limit = Math.min(stepIdx, trace.length - 1);
-    for (let i = 0; i <= limit; i++) {
-      const s = trace[i];
-      if (!s) continue;
-      if (s.rf_we === 1 && s.rd_addr >= 0 && s.rd_addr < 8) {
-        regs[s.rd_addr] = parseInt(s.rf_data, 16) || 0;
-      }
-      if (s.mem_we === 1) {
-        const mAddr = parseInt(s.mem_addr, 16) || 0;
-        if (mAddr >= 0 && mAddr < 256) {
-          dmem[mAddr] = parseInt(s.mem_data, 16) || 0;
-        }
-      }
-      flags = s.flags || flags;
-
-      if (s.decoded.opcode === 0xe && s.decoded.io_dir === 1) {
-        const portNum = parseInt(s.decoded.port, 16);
-        const srcVal = regs[s.decoded.rd] ?? 0;
-        const signedSrc = srcVal >= 128 ? srcVal - 256 : srcVal;
-        if (portNum === 0x02) leds = srcVal;
-        if (portNum === 0x10) segVal = srcVal;
-        if (portNum === 0x11) segEn = srcVal;
-        if (portNum === 0x5f && srcVal === 0xa5) nnUnlocked = true;
-        if (nnUnlocked) {
-          if (portNum === 0x50) nnA = signedSrc;
-          if (portNum === 0x51) {
-            nnW = signedSrc;
-            if (nnA === 0 || nnW === 0) {
-              nnSkipCnt = Math.min(255, nnSkipCnt + 1);
-            } else {
-              nnMacCnt = Math.min(255, nnMacCnt + 1);
-            }
-            nnAcc = nnAcc + nnA * nnW;
-          }
-          if (portNum === 0x52) {
-            if (srcVal & 1) nnAcc = 0;
-            if (srcVal & 2) {
-              nnSkipCnt = 0;
-              nnMacCnt = 0;
-            }
-          }
-          if (portNum === 0x56) nnShift = srcVal & 0x0f;
-          if (portNum === 0x58) nnLutSel = srcVal & 0x03;
-        }
-      }
-    }
-
-    const qoutRaw = nnAcc >> nnShift;
-    const nnQout = Math.max(-128, Math.min(127, qoutRaw));
-    const nnAct = nnLutSel === 0 ? Math.max(0, nnQout) : nnQout;
-    const atEnd = trace.length > 0 && stepIdx >= trace.length - 1;
-
-    return {
-      regs,
-      dmem,
-      flags,
-      leds: atEnd && finalState.leds !== undefined ? finalState.leds : leds,
-      segVal: atEnd && finalState.seg_value !== undefined ? finalState.seg_value : segVal,
-      segEn: atEnd && finalState.seg_enable !== undefined ? finalState.seg_enable : segEn,
-      nn: {
-        unlocked: nnUnlocked || Boolean(atEnd && finalState.nn?.unlocked),
-        a: nnA,
-        w: nnW,
-        acc: nnAcc,
-        shift: nnShift,
-        qout: nnQout,
-        lut_sel: nnLutSel,
-        act: nnAct,
-        skip_cnt: nnSkipCnt,
-        mac_cnt: nnMacCnt,
-      },
-    };
-  }, [trace, stepIdx, finalState]);
-
-  const currentStep: TraceStep | null = trace[stepIdx] ?? null;
+  const consoleEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!isPlaying) return;
-    const timer = setInterval(() => {
-      setStepIdx((prev) => {
-        const next = prev + 1;
-        if (next >= trace.length) {
-          setIsPlaying(false);
-          return prev;
-        }
-        const nextStep = trace[next];
-        if (nextStep && breakpoints.includes(nextStep.pc_int)) {
-          setIsPlaying(false);
-          setDebugNotice(`Breakpoint hit at PC ${nextStep.pc} (Step #${nextStep.seq})`);
-          return next;
-        }
-        if (
-          watchReg !== null &&
-          nextStep &&
-          nextStep.rf_we === 1 &&
-          nextStep.rd_addr === watchReg
-        ) {
-          setIsPlaying(false);
-          setDebugNotice(
-            `Watchpoint hit: R${watchReg} written with ${nextStep.rf_data} at PC ${nextStep.pc}`
-          );
-          return next;
-        }
-        return next;
-      });
-    }, playSpeedMs);
-    return () => clearInterval(timer);
-  }, [isPlaying, trace, playSpeedMs, breakpoints, watchReg]);
-
-  useEffect(() => {
-    runSimulation(DEFAULT_ASM, true);
+    fetchPrograms();
     fetchNnSamples();
-    fetchNnLuts();
+    runSimulation(DEFAULT_ASM, true, 0, 0);
   }, []);
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [consoleLines]);
+  }, [consoleLogs]);
 
-  async function runSimulation(codeToSim = asmCode, nnMode = useNnSim) {
+  // Auto-stepping interval with Breakpoint & Watchpoint detection (Feature 1)
+  useEffect(() => {
+    if (!isPlaying) return;
+    const timer = setInterval(() => {
+      setStepIdx((prev) => {
+        if (prev < trace.length - 1) {
+          const nextStep = prev + 1;
+          const stepObj = trace[nextStep];
+          if (breakpoints.includes(stepObj.pc_int)) {
+            setIsPlaying(false);
+            setWatchAlert(`Paused at PC Breakpoint ${stepObj.pc}`);
+            return nextStep;
+          }
+          if (stepObj.rf_we === 1 && watchRegs.includes(stepObj.rd_addr)) {
+            setIsPlaying(false);
+            setWatchAlert(
+              `Watchpoint triggered: R${stepObj.rd_addr} <- ${stepObj.rf_data} at seq #${stepObj.seq}`
+            );
+            return nextStep;
+          }
+          return nextStep;
+        }
+        setIsPlaying(false);
+        return prev;
+      });
+    }, playSpeedMs);
+    return () => clearInterval(timer);
+  }, [isPlaying, trace.length, playSpeedMs, breakpoints, watchRegs, trace]);
+
+  const fetchPrograms = async () => {
+    try {
+      const data = await safeFetchJson(`${API_BASE}/api/programs`);
+      setPrograms(data.programs || []);
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[WARN] Failed to load preset list: ${e.message}`,
+      ]);
+    }
+  };
+
+  const fetchNnSamples = async () => {
+    try {
+      const data = await safeFetchJson(`${API_BASE}/api/nn/samples`);
+      const normalizedSamples: NNSample[] = Array.isArray(data.samples)
+        ? data.samples.map((s: any, idx: number) => ({
+            index: typeof s.index === "number" ? s.index : idx,
+            sample_id: s.sample_id || `s${String(idx).padStart(2, "0")}`,
+            features: Array.isArray(s.features) ? s.features : [0, 0, 0, 0],
+            expected_class:
+              typeof s.expected_class === "number" ? s.expected_class : 0,
+            class_name: s.class_name || `Class ${s.expected_class ?? 0}`,
+          }))
+        : [];
+      setNnSamples(normalizedSamples);
+      setCertifiedMetrics(
+        Array.isArray(data.certified_metrics) ? data.certified_metrics : []
+      );
+      setBenchMarkdown(data.bench_markdown || "");
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[WARN] Failed to load NN samples: ${e.message}`,
+      ]);
+    }
+  };
+
+  const handleSelectProgram = async (path: string) => {
+    setSelectedProgram(path);
+    if (!path) return;
+    try {
+      const data = await safeFetchJson(
+        `${API_BASE}/api/programs/load?path=${encodeURIComponent(path)}`
+      );
+      if (data.asm_code) {
+        setAsmCode(data.asm_code);
+        runSimulation(data.asm_code, useNnSim, switchBits, buttonBits);
+      }
+    } catch (e: any) {
+      setSimError(`Failed to load program: ${e.message}`);
+    }
+  };
+
+  const runSimulation = async (
+    codeToRun: string = asmCode,
+    nnMode: boolean = useNnSim,
+    swVal: number = switchBits,
+    btnVal: number = buttonBits
+  ) => {
     setIsSimulating(true);
     setSimError(null);
-    setDebugNotice(null);
+    setWatchAlert(null);
     setIsPlaying(false);
     try {
       const data = await safeFetchJson(`${API_BASE}/api/simulate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          asm_code: codeToSim,
+          asm_code: codeToRun,
           use_nn_sim: nnMode,
-          switches: `0x${switchesVal.toString(16).padStart(2, "0")}`,
-          buttons: `0x${buttonsVal.toString(16).padStart(2, "0")}`,
+          switches: `0x${swVal.toString(16).padStart(2, "0")}`,
+          buttons: `0x${btnVal.toString(16).padStart(2, "0")}`,
+          max_instrs: 50000,
         }),
       });
-      setTrace(data.trace || []);
-      setRawTrace(data.raw_trace || "");
-      setHexCode(data.hex || "");
-      setListing(data.listing || "");
-      setFinalState(data.state || {});
-      setStepIdx(0);
-    } catch (err: any) {
-      setSimError(err?.message || String(err));
+      if (!data.success) {
+        setSimError(`[${(data.stage || "ERROR").toUpperCase()}] ${data.error}`);
+        setTrace([]);
+      } else {
+        setHexOutput(data.hex || "");
+        setListingOutput(data.listing || "");
+        setRawTraceOutput(data.raw_trace || "");
+        setTrace(data.trace || []);
+        setFinalState(data.state || null);
+        setStepIdx(0);
+        setConsoleLogs((prev) => [
+          ...prev,
+          `[SIM] Assembled & executed ${data.total_retired} instructions (${
+            nnMode ? "dsd8sim_nn.py" : "dsd8sim.py"
+          }).`,
+        ]);
+      }
+    } catch (e: any) {
+      setSimError(`Simulation error: ${e.message}`);
     } finally {
       setIsSimulating(false);
     }
-  }
+  };
 
-  async function fetchNnSamples() {
+  const loadAndRunNnSample = async (sampleIdx: number, variant: string) => {
+    setSelectedSampleIdx(sampleIdx);
+    setSelectedVariant(variant);
     try {
-      const data = await safeFetchJson(`${API_BASE}/api/nn/samples`);
-      setNnSamples(data.samples || []);
-      setBenchMd(data.bench_md || "");
-      if (data.shift1 !== undefined) setCustomShift1(data.shift1);
-      if (data.shift2 !== undefined) setCustomShift2(data.shift2);
-    } catch {
-      // Ignore background fetch errors
+      const data = await safeFetchJson(
+        `${API_BASE}/api/nn/load-sample?sample_idx=${sampleIdx}&variant=${variant}`
+      );
+      if (data.asm_code) {
+        setAsmCode(data.asm_code);
+        setUseNnSim(true);
+        setActiveTab("ide");
+        await runSimulation(data.asm_code, true, switchBits, buttonBits);
+      }
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[ERROR] Could not load NN sample: ${e.message}`,
+      ]);
     }
-  }
+  };
 
-  async function fetchNnLuts() {
+  const runStreamCommand = (commandKey: string) => {
+    if (isRunningCmd) return;
+    setIsRunningCmd(true);
+    setConsoleLogs((prev) => [
+      ...prev,
+      `\n========================================`,
+      `> Starting target: ${commandKey}...`,
+    ]);
+
+    const evtSource = new EventSource(
+      `${API_BASE}/api/stream-command/${commandKey}`
+    );
+    evtSource.onmessage = (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type === "start") {
+        setConsoleLogs((prev) => [...prev, `$ ${payload.cmd}`]);
+      } else if (payload.type === "log") {
+        setConsoleLogs((prev) => [...prev, payload.line]);
+      } else if (payload.type === "done") {
+        const statusStr =
+          payload.returncode === 0 ? "SUCCESS (0)" : `FAILED (${payload.returncode})`;
+        setConsoleLogs((prev) => [
+          ...prev,
+          `> Target finished: ${statusStr} in ${payload.elapsed_sec}s`,
+        ]);
+        evtSource.close();
+        setIsRunningCmd(false);
+      } else if (payload.type === "error") {
+        setConsoleLogs((prev) => [...prev, `[ERROR] ${payload.message}`]);
+        evtSource.close();
+        setIsRunningCmd(false);
+      }
+    };
+    evtSource.onerror = () => {
+      setConsoleLogs((prev) => [...prev, `[SSE Stream Closed]`]);
+      evtSource.close();
+      setIsRunningCmd(false);
+    };
+  };
+
+  // Feature 3: Fetch VCD Waveform
+  const loadVcdWaveform = async () => {
+    setIsLoadingVcd(true);
     try {
-      const data = await safeFetchJson(`${API_BASE}/api/nn/lut`);
-      setLutsData(data.luts || {});
-    } catch {
-      // Ignore
+      const data = await safeFetchJson(
+        `${API_BASE}/api/waveform/vcd?generate_if_missing=true`
+      );
+      setVcdData(data);
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[WAVE] Loaded ${data.signals?.length || 0} hardware signals from build/waveform/dsd8_wave.vcd`,
+      ]);
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[ERROR] Waveform load failed: ${e.message}`,
+      ]);
+    } finally {
+      setIsLoadingVcd(false);
     }
-  }
+  };
 
-  async function loadSampleVariantAsm(sampleIdx: number, variant: string) {
+  // Feature 4: Run Unit Test / Conformance Target
+  const runSuiteTarget = async (targetKey: string) => {
+    setRunningTarget(targetKey);
     try {
-      setSimError(null);
-      const data = await safeFetchJson(`${API_BASE}/api/nn/sample/${sampleIdx}/${variant}`);
-      setAsmCode(data.asm_code);
-      setUseNnSim(true);
-      setActiveTab("cpu");
-      await runSimulation(data.asm_code, true);
-    } catch (err: any) {
-      setSimError(err?.message || String(err));
+      const data = await safeFetchJson(
+        `${API_BASE}/api/test-suite/${targetKey}`,
+        { method: "POST" }
+      );
+      setSuiteResults((prev) => ({ ...prev, [targetKey]: data }));
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[TEST SUITE] ${data.title}: ${
+          data.passed ? "PASS" : "FAIL"
+        } (${data.elapsed_sec}s)`,
+      ]);
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[ERROR] Suite target ${targetKey} failed: ${e.message}`,
+      ]);
+    } finally {
+      setRunningTarget(null);
     }
-  }
+  };
 
-  async function runCustomWizardInference() {
+  // Feature 5: Run Custom NN Inference Wizard
+  const runCustomInference = async () => {
     try {
-      setSimError(null);
       const data = await safeFetchJson(`${API_BASE}/api/nn/custom-infer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -468,130 +502,158 @@ export default function App() {
         }),
       });
       setCustomNnResult(data);
-    } catch (err: any) {
-      setSimError(`Custom NN inference error: ${err?.message || String(err)}`);
+    } catch (e: any) {
+      setConsoleLogs((prev) => [
+        ...prev,
+        `[ERROR] Custom NN inference error: ${e.message}`,
+      ]);
     }
-  }
+  };
 
-  async function loadVcdWaveform(generateNew: boolean) {
-    try {
-      const data = await safeFetchJson(
-        `${API_BASE}/api/waveform?generate=${generateNew ? "true" : "false"}`
-      );
-      if (data.signals && data.signals.length > 0) {
-        setWaveTimestamps(data.timestamps || []);
-        setWaveSignals(data.signals || []);
-        setWaveSource(data.source || "dsd8_wave.vcd");
+  useEffect(() => {
+    if (activeTab === "wizard" && !customNnResult) {
+      runCustomInference();
+    }
+    if (activeTab === "waveform" && !vcdData.exists) {
+      loadVcdWaveform();
+    }
+  }, [activeTab]);
+
+  // Reconstruct Architectural State at current `stepIdx`
+  const reconstructedState = useMemo(() => {
+    const regs = new Array(8).fill(0);
+    const dmem = new Array(256).fill(0);
+    let flags = "0000";
+    let totalCycles = 0;
+
+    let nnKeyUnlocked = false;
+    let nnA = 0;
+    let nnW = 0;
+    let nnAcc = 0;
+    let nnShift = 0;
+    let nnLutSel = 0;
+    let nnSkipCnt = 0;
+    let nnMacCnt = 0;
+    let leds = 0;
+    let segVal = 0;
+    let segEn = 0;
+
+    const limit = Math.min(stepIdx, trace.length - 1);
+    for (let i = 0; i <= limit; i++) {
+      const s = trace[i];
+      if (!s) continue;
+      flags = s.flags;
+      totalCycles += s.decoded.cycles;
+
+      if (s.rf_we === 1 && s.rd_addr >= 0 && s.rd_addr < 8) {
+        regs[s.rd_addr] = s.rf_data_int;
       }
-    } catch {
-      // Fallback to trace-synthesized waveform
-    }
-  }
+      if (s.mem_we === 1 && s.mem_addr_int >= 0 && s.mem_addr_int < 256) {
+        dmem[s.mem_addr_int] = s.mem_data_int;
+      }
 
-  const effectiveWaveform = useMemo(() => {
-    if (waveSignals.length > 0 && waveTimestamps.length > 0) {
-      return {
-        source: waveSource,
-        timestamps: waveTimestamps,
-        signals: waveSignals,
-      };
-    }
-    const slice = trace.slice(0, 60);
-    const ts = slice.map((s) => s.seq * 10);
-    const clkVals = slice.map((_, idx) => (idx % 2 === 0 ? "1" : "0"));
-    const pcVals = slice.map((s) => s.pc);
-    const irVals = slice.map((s) => s.ir);
-    const mnemVals = slice.map((s) => s.decoded.mnemonic);
-    const rfWeVals = slice.map((s) => String(s.rf_we));
-    const rfDataVals = slice.map((s) => s.rf_data);
-    const memWeVals = slice.map((s) => String(s.mem_we));
-    const flagsVals = slice.map((s) => s.flags);
+      // Track OUT instructions (opcode == 0xE and io_dir == 1)
+      // In DSD-8 ISA, OUT encodes source register Rs in bits [11:9] (s.decoded.rd)
+      if (s.decoded.opcode === 0xe && s.decoded.io_dir === 1) {
+        const portNum = parseInt(s.decoded.port, 16);
+        const rsVal = regs[s.decoded.rd] & 0xff;
+        const toSigned8 = (v: number) => (v & 0x80 ? v - 256 : v);
 
-    const synthSignals: WaveformSignal[] = [
-      { id: "s_clk", name: "sys_clk", width: 1, group: "CPU", values: clkVals },
-      { id: "s_pc", name: "pc[8:0]", width: 9, group: "CPU", values: pcVals },
-      { id: "s_ir", name: "ir[15:0]", width: 16, group: "CPU", values: irVals },
-      { id: "s_mnem", name: "opcode_mnem", width: 16, group: "CPU", values: mnemVals },
-      { id: "s_rfwe", name: "rf_we", width: 1, group: "CPU", values: rfWeVals },
-      { id: "s_rfdata", name: "rf_wdata[7:0]", width: 8, group: "CPU", values: rfDataVals },
-      { id: "s_memwe", name: "dmem_we", width: 1, group: "IO", values: memWeVals },
-      { id: "s_flags", name: "flags_ZNCV[3:0]", width: 4, group: "NN", values: flagsVals },
-    ];
+        if (portNum === 0x02) leds = rsVal;
+        if (portNum === 0x10) segVal = rsVal;
+        if (portNum === 0x11) segEn = rsVal;
+        if (portNum === 0x5f) nnKeyUnlocked = rsVal === 0xa5;
+        if (nnKeyUnlocked) {
+          if (portNum === 0x50) nnA = toSigned8(rsVal);
+          if (portNum === 0x51) {
+            nnW = toSigned8(rsVal);
+            if (nnA === 0 || nnW === 0) {
+              nnSkipCnt = Math.min(255, nnSkipCnt + 1);
+            } else {
+              nnMacCnt = Math.min(255, nnMacCnt + 1);
+              nnAcc = (nnAcc + nnA * nnW) & 0xffffff;
+              if (nnAcc & 0x800000) nnAcc -= 0x1000000;
+            }
+          }
+          if (portNum === 0x52) {
+            if (rsVal & 0x01) nnAcc = 0;
+            if (rsVal & 0x02) {
+              nnSkipCnt = 0;
+              nnMacCnt = 0;
+            }
+          }
+          if (portNum === 0x56) nnShift = rsVal & 0x0f;
+          if (portNum === 0x58) nnLutSel = rsVal & 0x03;
+        }
+      }
+    }
+
+    const shifted = nnAcc >> nnShift;
+    const nnQout = Math.max(-128, Math.min(127, shifted)) & 0xff;
+    const signedQ = nnQout & 0x80 ? nnQout - 256 : nnQout;
+    const nnAct = nnLutSel === 0 ? Math.max(0, signedQ) & 0xff : nnQout;
+
+    const isAtFinalStep = trace.length > 0 && stepIdx >= trace.length - 1;
+    if (isAtFinalStep && finalState?.io) {
+      if (typeof finalState.io.leds === "number") leds = finalState.io.leds;
+      if (typeof finalState.io.seg_value === "number")
+        segVal = finalState.io.seg_value;
+    }
+
     return {
-      source: "Active Simulation Trace (Live Synthesized)",
-      timestamps: ts,
-      signals: synthSignals,
+      regs,
+      dmem,
+      flags,
+      totalCycles,
+      leds,
+      segVal,
+      segEn,
+      nn: {
+        unlocked: nnKeyUnlocked,
+        nnA: nnA & 0xff,
+        nnW: nnW & 0xff,
+        nnAcc: nnAcc & 0xffffff,
+        nnShift,
+        nnQout,
+        nnLutSel,
+        nnAct,
+        nnSkipCnt,
+        nnMacCnt,
+      },
     };
-  }, [waveSignals, waveTimestamps, waveSource, trace]);
+  }, [trace, stepIdx, finalState]);
 
-  async function runSingleTestTarget(targetKey: string) {
-    setRunningTestKey(targetKey);
-    try {
-      const data = await safeFetchJson(`${API_BASE}/api/test-suite/${targetKey}`, {
-        method: "POST",
-      });
-      setTestResults((prev) => ({ ...prev, [targetKey]: data }));
-    } catch (err: any) {
-      setSimError(err?.message || String(err));
-    } finally {
-      setRunningTestKey(null);
-    }
-  }
+  const currentStep: TraceStep | null = trace[stepIdx] || null;
 
-  function runStreamCommand(cmdKey: string) {
-    if (isRunningCmd) return;
-    setIsRunningCmd(true);
-    setConsoleLines((prev) => [...prev, `\n--- Launching '${cmdKey}' ---`]);
-    const evtSource = new EventSource(`${API_BASE}/api/cmd/${cmdKey}`);
-    evtSource.onmessage = (event) => {
-      setConsoleLines((prev) => [...prev, event.data]);
-      if (event.data.includes("[Process exited")) {
-        evtSource.close();
-        setIsRunningCmd(false);
-        fetchNnSamples();
+  // Feature 1 Helpers: Jump to next breakpoint
+  const jumpToNextBreakpoint = () => {
+    if (breakpoints.length === 0) return;
+    for (let i = stepIdx + 1; i < trace.length; i++) {
+      if (breakpoints.includes(trace[i].pc_int)) {
+        setStepIdx(i);
+        setWatchAlert(`Jumped to Breakpoint at PC ${trace[i].pc}`);
+        return;
       }
-    };
-    evtSource.onerror = () => {
-      setConsoleLines((prev) => [...prev, "[Stream closed]"]);
-      evtSource.close();
-      setIsRunningCmd(false);
-    };
-  }
+    }
+    setWatchAlert("No subsequent breakpoint hit in trace.");
+  };
 
-  function toggleBreakpoint(pcInt: number) {
+  const toggleBreakpoint = (pcInt: number) => {
     setBreakpoints((prev) =>
       prev.includes(pcInt) ? prev.filter((p) => p !== pcInt) : [...prev, pcInt]
     );
-  }
+  };
 
-  function addBpFromInput() {
-    const parsed = parseInt(bpInput, 16);
-    if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 0x1ff) {
-      if (!breakpoints.includes(parsed)) {
-        setBreakpoints((prev) => [...prev, parsed]);
-      }
-    }
-  }
+  const toggleWatchReg = (regIdx: number) => {
+    setWatchRegs((prev) =>
+      prev.includes(regIdx)
+        ? prev.filter((r) => r !== regIdx)
+        : [...prev, regIdx]
+    );
+  };
 
-  function jumpToNextBreakpoint() {
-    for (let i = stepIdx + 1; i < trace.length; i++) {
-      const st = trace[i];
-      if (st && breakpoints.includes(st.pc_int)) {
-        setStepIdx(i);
-        setDebugNotice(`Jumped to breakpoint at PC ${st.pc} (Step #${st.seq})`);
-        return;
-      }
-      if (watchReg !== null && st && st.rf_we === 1 && st.rd_addr === watchReg) {
-        setStepIdx(i);
-        setDebugNotice(`Jumped to watchpoint R${watchReg} write at PC ${st.pc}`);
-        return;
-      }
-    }
-    setStepIdx(Math.max(0, trace.length - 1));
-    setDebugNotice("Reached end of program (HLT) without hitting another breakpoint.");
-  }
-
-  function downloadArtifact(filename: string, content: string) {
+  // Feature 6: Download Artifact Helper
+  const downloadTextFile = (filename: string, content: string) => {
     const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -599,220 +661,230 @@ export default function App() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
-  }
-
-  function exportPdfReport() {
-    const win = window.open("", "_blank");
-    if (!win) return;
-    win.document.write(`
-      <html>
-        <head>
-          <title>DSD-8 Processor & int8 NN Accelerator Verification Report</title>
-          <style>
-            body { font-family: system-ui, sans-serif; padding: 32px; color: #0f172a; }
-            h1 { color: #1d4ed8; margin-bottom: 4px; }
-            pre { background: #f1f5f9; padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; }
-            table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 13px; }
-            th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; }
-            th { background: #e2e8f0; }
-          </style>
-        </head>
-        <body>
-          <h1>DSD-8 Studio — Hardware Verification & Simulation Report</h1>
-          <p><strong>Total Instructions Executed:</strong> ${trace.length} | <strong>Final Flags (ZNCV):</strong> ${reconstructed.flags}</p>
-          <h2>Final Register File State (R0–R7)</h2>
-          <table>
-            <tr>${reconstructed.regs.map((_, idx) => `<th>R${idx}</th>`).join("")}</tr>
-            <tr>${reconstructed.regs
-              .map((v) => `<td>0x${v.toString(16).toUpperCase().padStart(2, "0")} (${v})</td>`)
-              .join("")}</tr>
-          </table>
-          <h2>int8 Neural Network Accelerator Telemetry</h2>
-          <p>24-bit Accumulator: <strong>${reconstructed.nn.acc}</strong> | Requantized QOUT: <strong>${reconstructed.nn.qout}</strong> | HW LUT Activation: <strong>${reconstructed.nn.act}</strong> | Executed MACs: <strong>${reconstructed.nn.mac_cnt}</strong> | Zero-Skips: <strong>${reconstructed.nn.skip_cnt}</strong></p>
-          <h2>Assembler Listing (.lst)</h2>
-          <pre>${listing || "No listing generated."}</pre>
-          <script>window.print();</script>
-        </body>
-      </html>
-    `);
-    win.document.close();
-  }
-
-  const dpActive = useMemo(() => {
-    const op = currentStep?.decoded.opcode ?? -1;
-    const isAlu = [0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb].includes(op);
-    const isMem = op === 0x2 || op === 0x3;
-    const isImm = op === 0x1;
-    const isBranch = op === 0xc || op === 0xd;
-    const isIo = op === 0xe;
-    const portNum = currentStep ? parseInt(currentStep.decoded.port, 16) : 0;
-    const isNn = isIo && portNum >= 0x50 && portNum <= 0x5f;
-    return { isAlu, isMem, isImm, isBranch, isIo, isNn };
-  }, [currentStep]);
+  };
 
   return (
-    <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col font-sans">
-      <header className="border-b border-slate-800/80 bg-[#0F1624]/95 backdrop-blur px-6 py-3 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
+    <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col font-sans selection:bg-blue-600 selection:text-white">
+      {/* Top Navigation Header */}
+      <header className="border-b border-slate-800/80 bg-[#0F1624]/90 backdrop-blur px-5 py-3 flex flex-wrap items-center justify-between gap-3 sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-blue-600/20 border border-blue-500/40 flex items-center justify-center text-blue-400 shadow-lg shadow-blue-600/10">
             <Cpu className="w-6 h-6" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-lg font-bold tracking-tight text-white">DSD-8 Studio</h1>
-              <span className="text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full bg-blue-600/20 text-blue-400 border border-blue-500/30">
-                8-Bit Harvard CPU + int8 NPU
+              <h1 className="text-lg font-bold tracking-tight text-white">
+                DSD-8 Studio
+              </h1>
+              <span className="text-[11px] font-mono uppercase px-2 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30">
+                Harvard 8-Bit CPU + int8 NN Accel
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Cycle-Accurate RTL Workbench, Datapath Visualizer & Neural Accelerator Suite
+              Cycle-Accurate Multicycle FSM, Datapath Schematic, VCD Waveform &
+              Neural Co-Processor Workbench
             </p>
           </div>
         </div>
 
-        <nav className="flex flex-wrap items-center gap-1 bg-[#090D16] p-1 rounded-xl border border-slate-800">
-          {[
-            { id: "cpu", label: "CPU Debugger", icon: Code2 },
-            { id: "datapath", label: "Live Datapath", icon: Cpu },
-            { id: "waveform", label: "Waveform (.vcd)", icon: Activity },
-            { id: "nn", label: "NN Benchmarks", icon: BrainCircuit },
-            { id: "wizard", label: "Quantization Wizard", icon: Sparkles },
-            { id: "verify", label: "Test Suite", icon: ShieldCheck },
-            { id: "toolchain", label: "RTL Console", icon: Terminal },
-          ].map((t) => {
-            const Icon = t.icon;
-            const active = activeTab === t.id;
-            return (
-              <button
-                key={t.id}
-                onClick={() => {
-                  setActiveTab(t.id as typeof activeTab);
-                  if (t.id === "waveform" && waveSignals.length === 0) {
-                    loadVcdWaveform(false);
-                  }
-                  if (t.id === "wizard" && !customNnResult) {
-                    runCustomWizardInference();
-                  }
-                }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                  active
-                    ? "bg-[#2563EB] text-white shadow-md shadow-blue-600/30"
-                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"
-                }`}
-              >
-                <Icon className="w-3.5 h-3.5" />
-                {t.label}
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="flex items-center gap-1.5">
+        {/* Navigation Pills */}
+        <div className="flex items-center gap-1 bg-[#090D16] p-1 rounded-xl border border-slate-800 overflow-x-auto">
           <button
-            onClick={() => downloadArtifact("program.asm", asmCode)}
-            title="Download Assembly Source (.asm)"
-            className="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 flex items-center gap-1"
+            onClick={() => setActiveTab("ide")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "ide"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
-            <FileCode className="w-3.5 h-3.5 text-blue-400" /> .asm
+            <Code2 className="w-3.5 h-3.5" /> CPU & Debugger
           </button>
           <button
-            onClick={() => downloadArtifact("program.hex", hexCode)}
-            disabled={!hexCode}
-            title="Download Assembled Machine Code (.hex)"
-            className="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 text-xs text-slate-300 border border-slate-700 flex items-center gap-1"
+            onClick={() => setActiveTab("datapath")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "datapath"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
-            <Download className="w-3.5 h-3.5 text-emerald-400" /> .hex
+            <Eye className="w-3.5 h-3.5" /> Live Datapath SVG
           </button>
           <button
-            onClick={() => downloadArtifact("program.lst", listing)}
-            disabled={!listing}
-            title="Download Assembler Two-Pass Listing (.lst)"
-            className="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 text-xs text-slate-300 border border-slate-700 flex items-center gap-1"
+            onClick={() => setActiveTab("waveform")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "waveform"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
-            <FileText className="w-3.5 h-3.5 text-amber-400" /> .lst
+            <Radio className="w-3.5 h-3.5" /> Waveform Viewer
           </button>
           <button
-            onClick={() => downloadArtifact("gold.trace", rawTrace)}
-            disabled={!rawTrace}
-            title="Download Golden Execution Trace (.trace)"
-            className="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 text-xs text-slate-300 border border-slate-700 flex items-center gap-1"
+            onClick={() => setActiveTab("nn")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "nn"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
-            <Activity className="w-3.5 h-3.5 text-purple-400" /> .trace
+            <Zap className="w-3.5 h-3.5" /> NN Benchmarks
           </button>
           <button
-            onClick={exportPdfReport}
-            title="Generate Printable PDF Hardware Verification Report"
-            className="px-2.5 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-xs text-blue-300 border border-blue-500/40 flex items-center gap-1 font-medium"
+            onClick={() => setActiveTab("wizard")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "wizard"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
-            <Printer className="w-3.5 h-3.5" /> PDF Report
+            <Sparkles className="w-3.5 h-3.5" /> Custom NN Wizard
+          </button>
+          <button
+            onClick={() => setActiveTab("verify")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+              activeTab === "verify"
+                ? "bg-blue-600 text-white shadow"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <ShieldCheck className="w-3.5 h-3.5" /> Test Suite & Export
           </button>
         </div>
       </header>
 
-      {simError && (
-        <div className="mx-6 mt-4 p-3 rounded-xl bg-red-950/60 border border-red-500/50 text-red-200 text-xs flex items-center justify-between">
-          <div className="flex items-center gap-2 font-mono whitespace-pre-wrap">
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            {simError}
-          </div>
-          <button
-            onClick={() => setSimError(null)}
-            className="text-red-300 hover:text-white text-xs underline ml-4"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {debugNotice && (
-        <div className="mx-6 mt-4 p-2.5 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs flex items-center justify-between">
-          <span className="font-mono">{debugNotice}</span>
-          <button
-            onClick={() => setDebugNotice(null)}
-            className="text-amber-300 hover:text-white underline text-xs"
-          >
-            Clear
-          </button>
-        </div>
-      )}
-
-      <main className="flex-1 p-6 max-w-[1600px] w-full mx-auto">
-        {activeTab === "cpu" && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-5 flex flex-col gap-5">
+      {/* Main Content Area */}
+      <main className="flex-1 p-4 lg:p-5 max-w-[1640px] w-full mx-auto space-y-5">
+        {/* ================================================================
+            TAB 1: CPU & DEBUGGER WORKBENCH + VIRTUAL FPGA BOARD (FEATURE 1)
+           ================================================================ */}
+        {activeTab === "ide" && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* LEFT COLUMN: Editor, Controls, Breakpoints (5 cols) */}
+            <div className="lg:col-span-5 flex flex-col gap-4">
               <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col gap-3 shadow-xl">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                    <Code2 className="w-4 h-4 text-blue-400" />
-                    DSD-8 Assembly Editor (512-Word IMEM)
-                  </h2>
-                  <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={useNnSim}
-                      onChange={(e) => setUseNnSim(e.target.checked)}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600"
-                    />
-                    NN-Aware Sim (0x50–0x5F)
-                  </label>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-blue-400" />
+                    <span className="text-sm font-semibold">
+                      Program Source & Assembler
+                    </span>
+                  </div>
+
+                  <select
+                    value={selectedProgram}
+                    onChange={(e) => handleSelectProgram(e.target.value)}
+                    className="bg-[#090D16] border border-slate-700 text-xs rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-blue-500"
+                  >
+                    <option value="">-- Load Preset Test / NN Program --</option>
+                    {programs.map((p) => (
+                      <option key={p.id} value={p.path}>
+                        [{p.category}] {p.name}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
-                <textarea
-                  value={asmCode}
-                  onChange={(e) => setAsmCode(e.target.value)}
-                  rows={12}
-                  spellCheck={false}
-                  className="w-full bg-[#090D16] border border-slate-800 rounded-xl p-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-blue-500 resize-y"
-                />
+                {/* Sub-tabs for Assembly / Listing / Hex + Artifact Export (Feature 6) */}
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <div className="flex gap-1">
+                    {(["asm", "listing", "hex"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => setCodeView(mode)}
+                        className={`px-2.5 py-1 rounded text-xs font-mono uppercase transition ${
+                          codeView === mode
+                            ? "bg-blue-600/20 text-blue-400 border border-blue-500/40"
+                            : "text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        {mode === "asm"
+                          ? "prog.asm"
+                          : mode === "listing"
+                          ? "prog.lst"
+                          : "prog.hex"}
+                      </button>
+                    ))}
+                  </div>
 
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() =>
+                        downloadTextFile(
+                          codeView === "asm"
+                            ? "prog.asm"
+                            : codeView === "listing"
+                            ? "prog.lst"
+                            : "prog.hex",
+                          codeView === "asm"
+                            ? asmCode
+                            : codeView === "listing"
+                            ? listingOutput
+                            : hexOutput
+                        )
+                      }
+                      className="text-[11px] flex items-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                      title="Download current file"
+                    >
+                      <Download className="w-3 h-3" /> Export
+                    </button>
+                    <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={useNnSim}
+                        onChange={(e) => setUseNnSim(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-0"
+                      />
+                      NN-Aware Sim
+                    </label>
+                  </div>
+                </div>
+
+                {/* Code Editor / Viewer */}
+                {codeView === "asm" ? (
+                  <textarea
+                    value={asmCode}
+                    onChange={(e) => setAsmCode(e.target.value)}
+                    spellCheck={false}
+                    className="w-full h-[320px] bg-[#090D16] border border-slate-800 rounded-xl p-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-blue-500 resize-none leading-relaxed"
+                  />
+                ) : (
+                  <pre className="w-full h-[320px] bg-[#090D16] border border-slate-800 rounded-xl p-3 font-mono text-xs text-emerald-300 overflow-auto leading-relaxed">
+                    {codeView === "listing"
+                      ? listingOutput || "; Assemble first to view two-pass listing"
+                      : hexOutput || "; Assemble first to view 16-bit hex words"}
+                  </pre>
+                )}
+
+                {simError && (
+                  <div className="bg-red-950/60 border border-red-700/60 rounded-xl p-3 text-xs font-mono text-red-300 flex items-start gap-2">
+                    <XCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                    <div className="whitespace-pre-wrap">{simError}</div>
+                  </div>
+                )}
+
+                {watchAlert && (
+                  <div className="bg-amber-950/50 border border-amber-500/40 rounded-xl px-3 py-2 text-xs font-mono text-amber-300 flex items-center justify-between">
+                    <span>⚡ {watchAlert}</span>
+                    <button
+                      onClick={() => setWatchAlert(null)}
+                      className="text-[10px] underline"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+
+                {/* Execution & Stepping Bar (Feature 1) */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                   <button
-                    onClick={() => runSimulation(asmCode, useNnSim)}
+                    onClick={() =>
+                      runSimulation(asmCode, useNnSim, switchBits, buttonBits)
+                    }
                     disabled={isSimulating}
-                    className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-lg shadow-blue-600/25 cursor-pointer"
+                    className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-semibold text-white shadow-lg shadow-blue-600/20 flex items-center gap-1.5 transition cursor-pointer"
                   >
-                    <Play className="w-3.5 h-3.5" />
-                    {isSimulating ? "Assembling..." : "Assemble & Simulate"}
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    {isSimulating ? "Running..." : "Assemble & Simulate"}
                   </button>
 
                   <div className="flex items-center gap-1 bg-[#090D16] p-1 rounded-xl border border-slate-800">
@@ -831,7 +903,7 @@ export default function App() {
                         setIsPlaying(false);
                         setStepIdx((s) => Math.max(0, s - 1));
                       }}
-                      title="Step Backward (-1)"
+                      title="Step Backward"
                       className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300"
                     >
                       <SkipBack className="w-4 h-4" />
@@ -839,23 +911,28 @@ export default function App() {
                     <button
                       onClick={() => setIsPlaying((p) => !p)}
                       title="Auto-Step Play/Pause"
-                      className="p-1.5 rounded-lg bg-blue-600/20 text-blue-400 hover:bg-blue-600/30"
+                      className="px-2.5 py-1.5 rounded-lg bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/30 flex items-center gap-1 text-xs font-medium"
                     >
-                      {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                      {isPlaying ? (
+                        <Pause className="w-3.5 h-3.5" />
+                      ) : (
+                        <Play className="w-3.5 h-3.5" />
+                      )}
+                      {isPlaying ? "Pause" : "Play"}
                     </button>
                     <button
                       onClick={() => {
                         setIsPlaying(false);
-                        setStepIdx((s) => Math.min(Math.max(0, trace.length - 1), s + 1));
+                        setStepIdx((s) => Math.min(trace.length - 1, s + 1));
                       }}
-                      title="Step Forward (+1)"
+                      title="Step Forward"
                       className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300"
                     >
                       <SkipForward className="w-4 h-4" />
                     </button>
                     <button
                       onClick={jumpToNextBreakpoint}
-                      title="Run to Next Breakpoint / Watchpoint"
+                      title="Jump to Next PC Breakpoint"
                       className="p-1.5 rounded-lg hover:bg-slate-800 text-amber-400"
                     >
                       <FastForward className="w-4 h-4" />
@@ -863,256 +940,314 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between gap-4 text-xs text-slate-400 pt-1">
-                  <span>
-                    Step:{" "}
-                    <strong className="text-white">
-                      {trace.length > 0 ? stepIdx + 1 : 0} / {trace.length}
-                    </strong>
-                  </span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={Math.max(0, trace.length - 1)}
-                    value={stepIdx}
-                    onChange={(e) => {
-                      setIsPlaying(false);
-                      setStepIdx(Number(e.target.value));
-                    }}
-                    className="flex-1 accent-blue-500"
-                  />
-                  <div className="flex items-center gap-1">
-                    <span>Speed:</span>
-                    <select
-                      value={playSpeedMs}
-                      onChange={(e) => setPlaySpeedMs(Number(e.target.value))}
-                      className="bg-[#090D16] border border-slate-800 rounded px-1.5 py-0.5 text-xs text-slate-200"
-                    >
-                      <option value={500}>Slow</option>
-                      <option value={250}>Normal</option>
-                      <option value={80}>Fast</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="border-t border-slate-800/80 pt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-slate-400">PC Breakpoint:</span>
-                    <input
-                      type="text"
-                      value={bpInput}
-                      onChange={(e) => setBpInput(e.target.value)}
-                      placeholder="0x006"
-                      className="w-16 bg-[#090D16] border border-slate-800 rounded px-2 py-1 font-mono text-xs text-white"
-                    />
-                    <button
-                      onClick={addBpFromInput}
-                      className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
-                    >
-                      + Add
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-slate-400">Watch Reg:</span>
-                    <select
-                      value={watchReg === null ? "" : watchReg}
-                      onChange={(e) =>
-                        setWatchReg(e.target.value === "" ? null : Number(e.target.value))
-                      }
-                      className="bg-[#090D16] border border-slate-800 rounded px-2 py-1 text-xs text-white"
-                    >
-                      <option value="">None</option>
-                      {[0, 1, 2, 3, 4, 5, 6, 7].map((r) => (
-                        <option key={r} value={r}>
-                          R{r}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                {breakpoints.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                    <span className="text-slate-400">Active Breakpoints:</span>
-                    {breakpoints.map((bp) => (
-                      <span
-                        key={bp}
-                        onClick={() => toggleBreakpoint(bp)}
-                        className="px-2 py-0.5 rounded-full bg-red-500/20 border border-red-500/40 text-red-300 font-mono cursor-pointer hover:bg-red-500/30"
-                      >
-                        0x{bp.toString(16).toUpperCase().padStart(3, "0")} ×
+                {/* Speed Slider & Timeline Scrubber */}
+                {trace.length > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex justify-between items-center text-[11px] font-mono text-slate-400">
+                      <span>
+                        Retired Seq:{" "}
+                        <strong className="text-white">{stepIdx + 1}</strong> /{" "}
+                        {trace.length}
                       </span>
-                    ))}
+                      <div className="flex items-center gap-2">
+                        <span>Speed:</span>
+                        <select
+                          value={playSpeedMs}
+                          onChange={(e) =>
+                            setPlaySpeedMs(Number(e.target.value))
+                          }
+                          className="bg-[#090D16] border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-200"
+                        >
+                          <option value={500}>Slow (2 Hz)</option>
+                          <option value={200}>Normal (5 Hz)</option>
+                          <option value={60}>Fast (16 Hz)</option>
+                          <option value={15}>Turbo (60 Hz)</option>
+                        </select>
+                        <span>
+                          Est. Cycles:{" "}
+                          <strong className="text-blue-400">
+                            {reconstructedState.totalCycles}
+                          </strong>
+                        </span>
+                      </div>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(0, trace.length - 1)}
+                      value={stepIdx}
+                      onChange={(e) => {
+                        setIsPlaying(false);
+                        setStepIdx(Number(e.target.value));
+                      }}
+                      className="w-full accent-blue-600 cursor-pointer"
+                    />
                   </div>
                 )}
               </div>
 
-              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col gap-3 shadow-xl">
+              {/* Feature 1: Interactive Virtual FPGA Board Periphery (Switches, Buttons, LEDs, 7-Seg) */}
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl space-y-3">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                    <Sliders className="w-4 h-4 text-blue-400" />
-                    Virtual FPGA Board Peripherals (Ports 0x00–0x11)
-                  </h3>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    7-Seg:{" "}
-                    <strong className="text-emerald-400">
-                      0x{reconstructed.segVal.toString(16).toUpperCase().padStart(2, "0")}
-                    </strong>
+                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <Sliders className="w-3.5 h-3.5 text-blue-400" /> Virtual
+                    FPGA Board Periphery (Ports 0x00 - 0x11)
                   </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => {
+                        setAsmCode(IO_SWITCH_DEMO_ASM);
+                        setUseNnSim(false);
+                        runSimulation(
+                          IO_SWITCH_DEMO_ASM,
+                          false,
+                          switchBits,
+                          buttonBits
+                        );
+                      }}
+                      className="text-[11px] px-2.5 py-1 rounded-lg bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition"
+                      title="Load & simulate an IN/OUT test program that reads switches/buttons into LEDs/7-Seg"
+                    >
+                      Load Switch→LED Demo
+                    </button>
+                    <button
+                      onClick={() => {
+                        setUseNnSim(false);
+                        runSimulation(asmCode, false, switchBits, buttonBits);
+                      }}
+                      className="text-[11px] px-2.5 py-1 rounded-lg bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/30 transition"
+                    >
+                      Re-Sim with Inputs
+                    </button>
+                  </div>
                 </div>
 
-                <div>
-                  <div className="text-xs text-slate-400 mb-1.5 flex justify-between">
-                    <span>Board LEDs (Port 0x02)</span>
-                    <span className="font-mono text-emerald-400">
-                      0x{reconstructed.leds.toString(16).toUpperCase().padStart(2, "0")}
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-8 gap-2 bg-[#090D16] p-2.5 rounded-xl border border-slate-800">
-                    {[7, 6, 5, 4, 3, 2, 1, 0].map((bit) => {
-                      const isOn = ((reconstructed.leds >> bit) & 1) === 1;
-                      return (
-                        <div key={bit} className="flex flex-col items-center gap-1">
-                          <div
-                            className={`w-4 h-4 rounded-full transition-all ${
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {/* 8 Slide Switches (0x00) */}
+                  <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                    <div className="flex justify-between text-[11px] font-mono text-slate-400 mb-2">
+                      <span>SWITCHES (0x00)</span>
+                      <span className="text-blue-400 font-bold">
+                        0x{switchBits.toString(16).padStart(2, "0").toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-8 gap-1">
+                      {[7, 6, 5, 4, 3, 2, 1, 0].map((bit) => {
+                        const isOn = ((switchBits >> bit) & 1) === 1;
+                        return (
+                          <button
+                            key={bit}
+                            onClick={() => setSwitchBits((v) => v ^ (1 << bit))}
+                            className={`h-8 rounded flex flex-col items-center justify-center text-[10px] font-mono border transition ${
                               isOn
-                                ? "bg-emerald-400 shadow-lg shadow-emerald-500/60 border border-emerald-200"
-                                : "bg-slate-800 border border-slate-700"
+                                ? "bg-blue-600 text-white border-blue-400"
+                                : "bg-slate-900 text-slate-500 border-slate-800"
                             }`}
-                          />
-                          <span className="text-[10px] font-mono text-slate-500">LED{bit}</span>
-                        </div>
-                      );
-                    })}
+                          >
+                            <span>{bit}</span>
+                            <span className="text-[8px]">{isOn ? "1" : "0"}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
 
-                <div>
-                  <div className="text-xs text-slate-400 mb-1.5 flex justify-between">
-                    <span>Slide Switches (Port 0x00 — Click to toggle)</span>
-                    <span className="font-mono text-blue-400">
-                      0x{switchesVal.toString(16).toUpperCase().padStart(2, "0")}
-                    </span>
+                  {/* Push Buttons (0x01) + 7-Seg Display (0x10) */}
+                  <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3 flex flex-col justify-between">
+                    <div className="flex justify-between text-[11px] font-mono text-slate-400 mb-1">
+                      <span>BUTTONS (0x01)</span>
+                      <span className="text-amber-400 font-bold">
+                        0x{buttonBits.toString(16).padStart(2, "0").toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {[3, 2, 1, 0].map((bit) => {
+                        const pressed = ((buttonBits >> bit) & 1) === 1;
+                        return (
+                          <button
+                            key={bit}
+                            onClick={() => setButtonBits((v) => v ^ (1 << bit))}
+                            className={`py-1.5 rounded text-[10px] font-mono border transition ${
+                              pressed
+                                ? "bg-amber-500 text-slate-950 font-bold border-amber-300"
+                                : "bg-slate-900 text-slate-400 border-slate-800"
+                            }`}
+                          >
+                            B{bit}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                  <div className="grid grid-cols-8 gap-2 bg-[#090D16] p-2.5 rounded-xl border border-slate-800">
-                    {[7, 6, 5, 4, 3, 2, 1, 0].map((bit) => {
-                      const isOn = ((switchesVal >> bit) & 1) === 1;
-                      return (
-                        <button
-                          key={bit}
-                          onClick={() => setSwitchesVal((v) => v ^ (1 << bit))}
-                          className={`py-1 rounded text-[10px] font-mono border transition-all ${
-                            isOn
-                              ? "bg-blue-600 text-white border-blue-400"
-                              : "bg-slate-900 text-slate-500 border-slate-800"
-                          }`}
-                        >
-                          SW{bit}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
 
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs text-slate-400">Push Buttons (Port 0x01):</span>
-                  <div className="flex gap-1.5">
-                    {[3, 2, 1, 0].map((btn) => {
-                      const isPressed = ((buttonsVal >> btn) & 1) === 1;
-                      return (
-                        <button
-                          key={btn}
-                          onClick={() => setButtonsVal((b) => b ^ (1 << btn))}
-                          className={`px-2.5 py-1 rounded-lg text-xs font-mono border ${
-                            isPressed
-                              ? "bg-amber-500/30 border-amber-400 text-amber-200"
-                              : "bg-[#090D16] border-slate-800 text-slate-400"
-                          }`}
-                        >
-                          BTN{btn}
-                        </button>
-                      );
-                    })}
+                  {/* 8 Red/Green LEDs (0x02) + Dual Hex 7-Segment (0x10) */}
+                  <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3 flex flex-col justify-between">
+                    <div className="flex justify-between items-center text-[11px] font-mono text-slate-400">
+                      <span>LEDS (0x02)</span>
+                      <span className="text-emerald-400 font-bold">
+                        7-SEG:{" "}
+                        {reconstructedState.segVal
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-1 pt-2">
+                      {[7, 6, 5, 4, 3, 2, 1, 0].map((bit) => {
+                        const lit =
+                          ((reconstructedState.leds >> bit) & 1) === 1;
+                        return (
+                          <div
+                            key={bit}
+                            className="flex flex-col items-center gap-1"
+                          >
+                            <div
+                              className={`w-3.5 h-3.5 rounded-full border transition-all ${
+                                lit
+                                  ? "bg-emerald-400 border-emerald-200 shadow-[0_0_10px_#34d399]"
+                                  : "bg-slate-900 border-slate-700"
+                              }`}
+                            />
+                            <span className="text-[9px] font-mono text-slate-500">
+                              L{bit}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div className="lg:col-span-7 flex flex-col gap-5">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="md:col-span-2 bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex items-center justify-between">
-                  <div>
-                    <span className="text-[11px] uppercase tracking-wider text-slate-400">
-                      Current Instruction (Step #{currentStep?.seq ?? 0})
+            {/* RIGHT COLUMN: 6-State FSM, Registers + Watchpoints, NN Co-Processor, Trace (7 cols) */}
+            <div className="lg:col-span-7 flex flex-col gap-4">
+              {/* Row 1: Multicycle FSM Pipeline & Current Instruction Decoder */}
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-blue-400" />
+                    <span className="text-sm font-semibold">
+                      6-State Multicycle Control FSM & Instruction Decoder
                     </span>
-                    <div className="flex items-center gap-3 mt-1">
-                      <span className="text-xl font-bold font-mono text-blue-400">
-                        {currentStep?.decoded.mnemonic ?? "READY"}
+                  </div>
+                  {currentStep && (
+                    <div className="flex items-center gap-2 font-mono text-xs">
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                        PC: <strong className="text-white">{currentStep.pc}</strong>
                       </span>
-                      <span className="text-xs font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-200">
-                        PC: {currentStep?.pc ?? "0x000"}
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                        IR: <strong className="text-blue-400">{currentStep.ir}</strong>
                       </span>
-                      <span className="text-xs font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">
-                        IR: {currentStep?.ir ?? "0x0000"}
+                      <span className="px-2.5 py-0.5 rounded bg-blue-600/20 text-blue-300 border border-blue-500/30 font-semibold">
+                        {currentStep.decoded.disassembly}
                       </span>
                     </div>
-                  </div>
-                  <div className="text-right font-mono text-xs text-slate-400">
-                    <div>wb_sel: {currentStep?.decoded.wb_sel ?? "None"}</div>
-                    <div>Port/Imm: {currentStep?.decoded.imm8 ?? "0x00"}</div>
-                  </div>
+                  )}
                 </div>
 
-                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-                  <span className="text-[11px] uppercase tracking-wider text-slate-400">
-                    ALU Flags (Z N C V)
-                  </span>
-                  <div className="grid grid-cols-4 gap-2 mt-2">
-                    {["Z", "N", "C", "V"].map((f, i) => {
-                      const active = reconstructed.flags[i] === "1";
-                      return (
-                        <div
-                          key={f}
-                          className={`py-1.5 rounded-lg text-center font-mono text-xs font-bold border ${
-                            active
-                              ? "bg-blue-600/30 border-blue-400 text-blue-200"
-                              : "bg-[#090D16] border-slate-800 text-slate-500"
-                          }`}
-                        >
-                          {f}:{active ? 1 : 0}
+                {/* 6-State FSM Visual Pipeline */}
+                <div className="grid grid-cols-6 gap-2 pt-1">
+                  {[
+                    "FETCH",
+                    "DECODE",
+                    "EXECUTE",
+                    "MEM_IO",
+                    "WRITEBACK",
+                    "HALTED_S",
+                  ].map((st) => {
+                    const activeStates = currentStep?.decoded.fsm_states || [];
+                    const isVisited = activeStates.includes(st);
+                    const isHalt = st === "HALTED_S" && isVisited;
+                    return (
+                      <div
+                        key={st}
+                        className={`rounded-xl px-2 py-2.5 border text-center transition-all ${
+                          isHalt
+                            ? "bg-red-500/20 border-red-500 text-red-300 shadow-lg shadow-red-500/10"
+                            : isVisited
+                            ? "bg-blue-600/25 border-blue-500 text-white shadow-lg shadow-blue-600/10"
+                            : "bg-[#090D16] border-slate-800/80 text-slate-600"
+                        }`}
+                      >
+                        <div className="text-[10px] font-mono font-bold tracking-wider">
+                          {st}
                         </div>
-                      );
-                    })}
-                  </div>
+                        <div className="text-[10px] mt-0.5 opacity-75">
+                          {isVisited ? "ACTIVE" : "IDLE"}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
+              {/* Row 2: 8x8 Register File (with Watchpoints) + ZNCV Flags & int8 NN Accelerator */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">
-                    General-Purpose Registers (R0–R7)
-                  </h3>
-                  <div className="grid grid-cols-4 gap-2.5">
-                    {reconstructed.regs.map((val, idx) => {
-                      const signedVal = val >= 128 ? val - 256 : val;
-                      const isWritten =
-                        currentStep?.rf_we === 1 && currentStep?.rd_addr === idx;
+                {/* Register File R0..R7 + Watchpoints + Flags */}
+                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Register File (Click Watchpoint 🔔)
+                    </span>
+                    <div className="flex gap-1.5">
+                      {["Z", "N", "C", "V"].map((flg, idx) => {
+                        const bitVal =
+                          reconstructedState.flags[idx] === "1" ? 1 : 0;
+                        return (
+                          <span
+                            key={flg}
+                            className={`px-2 py-0.5 rounded text-xs font-mono font-bold border ${
+                              bitVal
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                                : "bg-[#090D16] text-slate-500 border-slate-800"
+                            }`}
+                          >
+                            {flg}:{bitVal}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2">
+                    {reconstructedState.regs.map((val, idx) => {
+                      const justWritten =
+                        currentStep?.rf_we === 1 &&
+                        currentStep?.rd_addr === idx;
+                      const isWatched = watchRegs.includes(idx);
+                      const signedVal = val & 0x80 ? val - 256 : val;
                       return (
                         <div
                           key={idx}
-                          className={`p-2.5 rounded-xl border font-mono transition-all ${
-                            isWritten
-                              ? "bg-blue-600/20 border-blue-400 shadow-md shadow-blue-500/20"
-                              : "bg-[#090D16] border-slate-800"
+                          onClick={() => toggleWatchReg(idx)}
+                          title="Click to toggle write watchpoint on this register"
+                          className={`rounded-xl p-2.5 border font-mono transition cursor-pointer ${
+                            justWritten
+                              ? "bg-blue-600/25 border-blue-400 text-white shadow-md shadow-blue-500/10"
+                              : isWatched
+                              ? "bg-amber-950/30 border-amber-500/50 text-slate-200"
+                              : "bg-[#090D16] border-slate-800 text-slate-200"
                           }`}
                         >
-                          <div className="flex justify-between text-[11px] text-slate-400">
+                          <div className="flex justify-between items-center text-[10px] text-slate-400">
                             <span>R{idx}</span>
-                            <span>{signedVal}</span>
+                            <span>
+                              {isWatched && (
+                                <span className="text-amber-400 mr-1">🔔</span>
+                              )}
+                              {justWritten && (
+                                <span className="text-blue-400 font-bold">
+                                  WRITE
+                                </span>
+                              )}
+                            </span>
                           </div>
-                          <div className="text-sm font-bold text-white mt-0.5">
-                            0x{val.toString(16).toUpperCase().padStart(2, "0")}
+                          <div className="text-sm font-bold mt-0.5">
+                            0x{val.toString(16).padStart(2, "0").toUpperCase()}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            u:{val} / s:{signedVal}
                           </div>
                         </div>
                       );
@@ -1120,496 +1255,716 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                      int8 NN Accelerator (0x50–0x5F)
-                    </h3>
+                {/* int8 Neural Network Accelerator Panel (0x50 - 0x5F) */}
+                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between gap-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 flex items-center gap-1.5">
+                      <Zap className="w-3.5 h-3.5" /> int8 NN Accelerator
+                      (0x50–0x5F)
+                    </span>
                     <span
-                      className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
-                        reconstructed.nn.unlocked
-                          ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
-                          : "bg-slate-800 border-slate-700 text-slate-400"
+                      className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                        reconstructedState.nn.unlocked
+                          ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                          : "bg-slate-800 text-slate-400 border-slate-700"
                       }`}
                     >
-                      {reconstructed.nn.unlocked ? "UNLOCKED (0xA5)" : "LOCKED"}
+                      {reconstructedState.nn.unlocked
+                        ? "KEY 0xA5 UNLOCKED"
+                        : "LOCKED"}
                     </span>
                   </div>
+
                   <div className="grid grid-cols-3 gap-2 font-mono text-xs">
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">24-Bit ACC</div>
-                      <div className="text-sm font-bold text-blue-400">
-                        {reconstructed.nn.acc}
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        NN_A (0x50)
+                      </div>
+                      <div className="font-bold text-slate-200">
+                        0x
+                        {reconstructedState.nn.nnA
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}
                       </div>
                     </div>
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">NN_QOUT (0x57)</div>
-                      <div className="text-sm font-bold text-emerald-400">
-                        {reconstructed.nn.qout}
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        NN_W (0x51)
+                      </div>
+                      <div className="font-bold text-slate-200">
+                        0x
+                        {reconstructedState.nn.nnW
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}
                       </div>
                     </div>
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">NN_ACT (0x59)</div>
-                      <div className="text-sm font-bold text-amber-400">
-                        {reconstructed.nn.act}
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        24-Bit ACC
+                      </div>
+                      <div className="font-bold text-blue-400">
+                        0x
+                        {reconstructedState.nn.nnAcc
+                          .toString(16)
+                          .padStart(6, "0")
+                          .toUpperCase()}
                       </div>
                     </div>
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">A * W Latch</div>
-                      <div className="text-xs text-slate-200">
-                        {reconstructed.nn.a} × {reconstructed.nn.w}
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        QOUT (0x57)
+                      </div>
+                      <div className="font-bold text-emerald-300">
+                        0x
+                        {reconstructedState.nn.nnQout
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}{" "}
+                        (&gt;&gt;{reconstructedState.nn.nnShift})
                       </div>
                     </div>
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">MACs (0x5D)</div>
-                      <div className="text-xs text-slate-200">{reconstructed.nn.mac_cnt}</div>
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        NN_ACT (0x59)
+                      </div>
+                      <div className="font-bold text-amber-300">
+                        0x
+                        {reconstructedState.nn.nnAct
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}{" "}
+                        (B{reconstructedState.nn.nnLutSel})
+                      </div>
                     </div>
-                    <div className="bg-[#090D16] p-2 rounded-xl border border-slate-800">
-                      <div className="text-[10px] text-slate-400">Zero-Skips (0x5C)</div>
-                      <div className="text-xs text-slate-200">{reconstructed.nn.skip_cnt}</div>
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-2">
+                      <div className="text-[10px] text-slate-500">
+                        MAC / SKIP
+                      </div>
+                      <div className="font-bold text-slate-200">
+                        {reconstructedState.nn.nnMacCnt} /{" "}
+                        <span className="text-blue-400">
+                          {reconstructedState.nn.nnSkipCnt}
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
 
-              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                    Cycle-Accurate Instruction Trace (Click ● gutter to set PC Breakpoint)
-                  </h3>
-                  <span className="text-xs text-slate-400 font-mono">
-                    {trace.length} instructions
-                  </span>
-                </div>
-                <div className="max-h-64 overflow-y-auto rounded-xl border border-slate-800 bg-[#090D16]">
-                  <table className="w-full text-left font-mono text-xs">
-                    <thead className="bg-slate-900/90 text-slate-400 sticky top-0">
-                      <tr>
-                        <th className="p-2 w-8">BP</th>
-                        <th className="p-2">#</th>
-                        <th className="p-2">PC</th>
-                        <th className="p-2">IR</th>
-                        <th className="p-2">Mnemonic</th>
-                        <th className="p-2">Reg Write</th>
-                        <th className="p-2">Mem Write</th>
-                        <th className="p-2">ZNCV</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {trace.slice(0, 250).map((st, idx) => {
-                        const isCurr = idx === stepIdx;
-                        const hasBp = breakpoints.includes(st.pc_int);
-                        return (
-                          <tr
-                            key={st.seq}
-                            onClick={() => {
-                              setIsPlaying(false);
-                              setStepIdx(idx);
-                            }}
-                            className={`border-t border-slate-800/60 cursor-pointer transition-colors ${
-                              isCurr
-                                ? "bg-blue-600/25 text-white"
-                                : "text-slate-300 hover:bg-slate-800/40"
-                            }`}
-                          >
-                            <td
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleBreakpoint(st.pc_int);
+              {/* Row 3: Golden Trace Table with Clickable PC Breakpoints (Feature 1) */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                <div className="md:col-span-7 bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col h-[270px]">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Instruction Trace (Click ● to toggle PC Breakpoint)
+                    </span>
+                    <span className="text-[11px] font-mono text-amber-400">
+                      Breakpoints: {breakpoints.length}
+                    </span>
+                  </div>
+                  <div className="flex-1 overflow-auto border border-slate-800/80 rounded-xl bg-[#090D16]">
+                    <table className="w-full text-left font-mono text-[11px]">
+                      <thead className="bg-slate-900/90 text-slate-400 sticky top-0">
+                        <tr>
+                          <th className="py-1.5 px-2">BP</th>
+                          <th className="py-1.5 px-2">#</th>
+                          <th className="py-1.5 px-2">PC</th>
+                          <th className="py-1.5 px-2">IR</th>
+                          <th className="py-1.5 px-2">Instruction</th>
+                          <th className="py-1.5 px-2">WB</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60">
+                        {trace.slice(0, 300).map((t, idx) => {
+                          const isCurr = idx === stepIdx;
+                          const hasBp = breakpoints.includes(t.pc_int);
+                          return (
+                            <tr
+                              key={t.seq}
+                              onClick={() => {
+                                setIsPlaying(false);
+                                setStepIdx(idx);
                               }}
-                              className="p-2 text-center"
+                              className={`cursor-pointer transition ${
+                                isCurr
+                                  ? "bg-blue-600/30 text-white font-semibold"
+                                  : "hover:bg-slate-800/50 text-slate-300"
+                              }`}
                             >
-                              <span
-                                className={`inline-block w-2.5 h-2.5 rounded-full ${
-                                  hasBp ? "bg-red-500" : "bg-slate-700 hover:bg-red-400/60"
-                                }`}
-                              />
-                            </td>
-                            <td className="p-2 text-slate-400">{st.seq}</td>
-                            <td className="p-2 text-blue-400">{st.pc}</td>
-                            <td className="p-2">{st.ir}</td>
-                            <td className="p-2 font-bold text-emerald-400">
-                              {st.decoded.mnemonic}
-                            </td>
-                            <td className="p-2">
-                              {st.rf_we ? `R${st.rd_addr} ← ${st.rf_data}` : "-"}
-                            </td>
-                            <td className="p-2">
-                              {st.mem_we ? `[${st.mem_addr}] ← ${st.mem_data}` : "-"}
-                            </td>
-                            <td className="p-2">{st.flags}</td>
-                          </tr>
+                              <td
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleBreakpoint(t.pc_int);
+                                }}
+                                className="py-1 px-2 text-center"
+                              >
+                                <span
+                                  className={`inline-block w-2.5 h-2.5 rounded-full ${
+                                    hasBp
+                                      ? "bg-red-500 shadow-[0_0_6px_#ef4444]"
+                                      : "bg-slate-800 hover:bg-slate-600"
+                                  }`}
+                                />
+                              </td>
+                              <td className="py-1 px-2 text-slate-500">
+                                {t.seq}
+                              </td>
+                              <td className="py-1 px-2">{t.pc}</td>
+                              <td className="py-1 px-2 text-blue-400">{t.ir}</td>
+                              <td className="py-1 px-2">
+                                {t.decoded.disassembly}
+                              </td>
+                              <td className="py-1 px-2 text-emerald-400">
+                                {t.rf_we
+                                  ? `R${t.rd_addr}=${t.rf_data}`
+                                  : t.mem_we
+                                  ? `[${t.mem_addr}]=${t.mem_data}`
+                                  : "-"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Data Memory 256B Hex Grid */}
+                <div className="md:col-span-5 bg-[#0F1624] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col h-[270px]">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Data Memory (256 Bytes)
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-500">
+                      0x00–0xFF
+                    </span>
+                  </div>
+                  <div className="flex-1 overflow-auto border border-slate-800/80 rounded-xl bg-[#090D16] p-2 font-mono text-[11px]">
+                    <div className="grid grid-cols-9 gap-1 text-center">
+                      <div className="text-slate-500">ADDR</div>
+                      {[0, 1, 2, 3, 4, 5, 6, 7].map((c) => (
+                        <div key={c} className="text-slate-500">
+                          +{c}
+                        </div>
+                      ))}
+                      {Array.from({ length: 32 }).map((_, rowIdx) => {
+                        const baseAddr = rowIdx * 8;
+                        return (
+                          <div key={`row-${baseAddr}`} className="contents">
+                            <div className="text-slate-500">
+                              0x
+                              {baseAddr
+                                .toString(16)
+                                .padStart(2, "0")
+                                .toUpperCase()}
+                            </div>
+                            {[0, 1, 2, 3, 4, 5, 6, 7].map((offset) => {
+                              const addr = baseAddr + offset;
+                              const val = reconstructedState.dmem[addr];
+                              const isModified =
+                                currentStep?.mem_we === 1 &&
+                                currentStep?.mem_addr_int === addr;
+                              return (
+                                <div
+                                  key={addr}
+                                  className={`rounded py-0.5 ${
+                                    isModified
+                                      ? "bg-blue-600 text-white font-bold"
+                                      : val !== 0
+                                      ? "text-emerald-300 bg-emerald-950/30"
+                                      : "text-slate-600"
+                                  }`}
+                                >
+                                  {val
+                                    .toString(16)
+                                    .padStart(2, "0")
+                                    .toUpperCase()}
+                                </div>
+                              );
+                            })}
+                          </div>
                         );
                       })}
-                    </tbody>
-                  </table>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         )}
 
+        {/* ================================================================
+            TAB 2: INTERACTIVE GRAPHICAL DATAPATH SCHEMATIC (FEATURE 2)
+           ================================================================ */}
         {activeTab === "datapath" && (
-          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-bold text-white flex items-center gap-2">
-                  <Cpu className="w-5 h-5 text-blue-400" />
-                  Live DSD-8 Harvard Architecture & int8 Coprocessor Datapath Schematic
+                  <Eye className="w-5 h-5 text-blue-400" />
+                  Live DSD-8 Harvard Datapath & Bus Activity Schematic
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Active buses and functional blocks illuminate in Electric Blue (#2563EB) for Step #
-                  {currentStep?.seq ?? 0} ({currentStep?.decoded.mnemonic ?? "NOP"})
+                  Buses and functional blocks illuminate dynamically in electric
+                  blue (#2563EB) based on the active instruction at Seq #
+                  {stepIdx + 1}
                 </p>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setStepIdx((s) => Math.max(0, s - 1))}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs"
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono"
                 >
-                  ← Prev Instruction
+                  ◀ Prev Instruction
                 </button>
-                <span className="text-xs font-mono text-blue-400 px-2">
-                  Step {stepIdx + 1} / {trace.length}
+                <span className="px-3 py-1.5 rounded-lg bg-[#090D16] border border-slate-800 text-xs font-mono text-blue-400">
+                  {currentStep
+                    ? `${currentStep.pc}: ${currentStep.decoded.disassembly}`
+                    : "No Trace"}
                 </span>
                 <button
-                  onClick={() => setStepIdx((s) => Math.min(trace.length - 1, s + 1))}
-                  className="px-3 py-1.5 rounded-lg bg-[#2563EB] hover:bg-blue-500 text-white text-xs"
+                  onClick={() =>
+                    setStepIdx((s) => Math.min(trace.length - 1, s + 1))
+                  }
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono"
                 >
-                  Next Instruction →
+                  Next Instruction ▶
                 </button>
               </div>
             </div>
 
-            <div className="w-full overflow-x-auto bg-[#090D16] border border-slate-800 rounded-2xl p-4">
-              <svg viewBox="0 0 1100 500" className="w-full h-auto min-w-[900px]">
-                <line x1="150" y1="140" x2="220" y2="140" stroke="#2563EB" strokeWidth="4" />
-                <line x1="390" y1="140" x2="460" y2="140" stroke="#2563EB" strokeWidth="4" />
-                <line x1="620" y1="140" x2="690" y2="140" stroke="#2563EB" strokeWidth="3" />
-                <line
-                  x1="850"
-                  y1="140"
-                  x2="920"
-                  y2="140"
-                  stroke={dpActive.isAlu ? "#2563EB" : "#334155"}
-                  strokeWidth={dpActive.isAlu ? "5" : "2.5"}
-                />
-                <line
-                  x1="770"
-                  y1="220"
-                  x2="770"
-                  y2="320"
-                  stroke={dpActive.isMem ? "#10B981" : "#334155"}
-                  strokeWidth={dpActive.isMem ? "5" : "2.5"}
-                />
-                <line
-                  x1="540"
-                  y1="220"
-                  x2="540"
-                  y2="320"
-                  stroke={dpActive.isNn ? "#F59E0B" : "#334155"}
-                  strokeWidth={dpActive.isNn ? "5" : "2.5"}
-                />
-                <path
-                  d="M 980 220 L 980 450 L 730 450 L 730 220"
-                  fill="none"
-                  stroke={currentStep?.rf_we ? "#2563EB" : "#1E293B"}
-                  strokeWidth={currentStep?.rf_we ? "4" : "2"}
-                  strokeDasharray={currentStep?.rf_we ? "none" : "6,6"}
-                />
+            {/* Interactive SVG Block Diagram */}
+            {(() => {
+              const op = currentStep?.decoded.opcode ?? 0;
+              const isAluOp = [0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb].includes(
+                op
+              );
+              const isMemOp = op === 0x2 || op === 0x3;
+              const isIoOp = op === 0xe;
+              const isWbActive = (currentStep?.rf_we ?? 0) === 1;
+              const isBranch = op === 0xc || op === 0xd;
 
-                <rect
-                  x="30"
-                  y="80"
-                  width="120"
-                  height="120"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke={dpActive.isBranch ? "#2563EB" : "#475569"}
-                  strokeWidth="3"
-                />
-                <text x="90" y="115" textAnchor="middle" fill="#94A3B8" fontSize="12">
-                  9-Bit PC
-                </text>
-                <text
-                  x="90"
-                  y="150"
-                  textAnchor="middle"
-                  fill="#60A5FA"
-                  fontSize="18"
-                  fontFamily="monospace"
-                  fontWeight="bold"
-                >
-                  {currentStep?.pc ?? "0x000"}
-                </text>
-                <text x="90" y="180" textAnchor="middle" fill="#64748B" fontSize="11">
-                  {dpActive.isBranch ? "BRANCH/JMP" : "PC + 1"}
-                </text>
+              const strokeActive = "#2563EB";
+              const strokeIdle = "#1E293B";
 
-                <rect
-                  x="220"
-                  y="70"
-                  width="170"
-                  height="140"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke="#2563EB"
-                  strokeWidth="3"
-                />
-                <text
-                  x="305"
-                  y="105"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  Instruction Memory
-                </text>
-                <text x="305" y="125" textAnchor="middle" fill="#94A3B8" fontSize="11">
-                  512 × 16-Bit Harvard ROM
-                </text>
-                <text
-                  x="305"
-                  y="160"
-                  textAnchor="middle"
-                  fill="#38BDF8"
-                  fontSize="17"
-                  fontFamily="monospace"
-                  fontWeight="bold"
-                >
-                  IR: {currentStep?.ir ?? "0x0000"}
-                </text>
+              return (
+                <div className="w-full overflow-x-auto bg-[#090D16] border border-slate-800 rounded-2xl p-4">
+                  <svg
+                    viewBox="0 0 1100 460"
+                    className="w-full min-w-[900px] h-auto font-mono"
+                  >
+                    {/*Connecting Buses */}
+                    {/* PC -> IMEM */}
+                    <line
+                      x1="150"
+                      y1="140"
+                      x2="220"
+                      y2="140"
+                      stroke={strokeActive}
+                      strokeWidth="4"
+                    />
+                    {/* IMEM -> IR/Decoder */}
+                    <line
+                      x1="370"
+                      y1="140"
+                      x2="440"
+                      y2="140"
+                      stroke={strokeActive}
+                      strokeWidth="4"
+                    />
+                    {/* Decoder -> RegFile */}
+                    <line
+                      x1="580"
+                      y1="140"
+                      x2="650"
+                      y2="140"
+                      stroke={strokeActive}
+                      strokeWidth="3"
+                    />
+                    {/* RegFile -> ALU */}
+                    <line
+                      x1="800"
+                      y1="140"
+                      x2="880"
+                      y2="140"
+                      stroke={isAluOp ? strokeActive : strokeIdle}
+                      strokeWidth="4"
+                    />
+                    {/* RegFile -> DMEM */}
+                    <path
+                      d="M 725 220 L 725 320 L 650 320"
+                      fill="none"
+                      stroke={isMemOp ? strokeActive : strokeIdle}
+                      strokeWidth="4"
+                    />
+                    {/* RegFile -> IO & NN Accel */}
+                    <path
+                      d="M 760 220 L 760 360 L 860 360"
+                      fill="none"
+                      stroke={isIoOp ? strokeActive : strokeIdle}
+                      strokeWidth="4"
+                    />
+                    {/* Writeback Bus -> RegFile */}
+                    <path
+                      d="M 960 220 L 960 420 L 700 420 L 700 220"
+                      fill="none"
+                      stroke={isWbActive ? "#10B981" : strokeIdle}
+                      strokeWidth="4"
+                      strokeDasharray={isWbActive ? "none" : "6,6"}
+                    />
 
-                <rect
-                  x="460"
-                  y="70"
-                  width="160"
-                  height="150"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke="#2563EB"
-                  strokeWidth="3"
-                />
-                <text
-                  x="540"
-                  y="100"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  Decoder & FSM
-                </text>
-                <text
-                  x="540"
-                  y="135"
-                  textAnchor="middle"
-                  fill="#34D399"
-                  fontSize="18"
-                  fontFamily="monospace"
-                  fontWeight="bold"
-                >
-                  {currentStep?.decoded.mnemonic ?? "NOP"}
-                </text>
-                <text
-                  x="540"
-                  y="165"
-                  textAnchor="middle"
-                  fill="#94A3B8"
-                  fontSize="11"
-                  fontFamily="monospace"
-                >
-                  imm8: {currentStep?.decoded.imm8 ?? "0x00"}
-                </text>
-                <text
-                  x="540"
-                  y="190"
-                  textAnchor="middle"
-                  fill="#60A5FA"
-                  fontSize="11"
-                  fontFamily="monospace"
-                >
-                  wb_sel: {currentStep?.decoded.wb_sel ?? "--"}
-                </text>
+                    {/* BLOCK 1: 9-Bit PC */}
+                    <rect
+                      x="30"
+                      y="85"
+                      width="120"
+                      height="110"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={isBranch ? "#F59E0B" : strokeActive}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="90"
+                      y="115"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      9-BIT PC
+                    </text>
+                    <text
+                      x="90"
+                      y="148"
+                      textAnchor="middle"
+                      fill="#F8FAFC"
+                      fontSize="18"
+                      fontWeight="bold"
+                    >
+                      {currentStep?.pc || "0x000"}
+                    </text>
+                    <text
+                      x="90"
+                      y="175"
+                      textAnchor="middle"
+                      fill="#38BDF8"
+                      fontSize="10"
+                    >
+                      {isBranch ? "BRANCH/JMP" : "PC + 1"}
+                    </text>
 
-                <rect
-                  x="690"
-                  y="70"
-                  width="160"
-                  height="150"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke={currentStep?.rf_we ? "#2563EB" : "#475569"}
-                  strokeWidth="3"
-                />
-                <text
-                  x="770"
-                  y="100"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  Register File (8×8)
-                </text>
-                <text
-                  x="770"
-                  y="130"
-                  textAnchor="middle"
-                  fill="#94A3B8"
-                  fontSize="12"
-                  fontFamily="monospace"
-                >
-                  Rd: R{currentStep?.decoded.rd ?? 0} | Rs1: R{currentStep?.decoded.rs1 ?? 0}
-                </text>
-                <text
-                  x="770"
-                  y="160"
-                  textAnchor="middle"
-                  fill="#60A5FA"
-                  fontSize="13"
-                  fontFamily="monospace"
-                >
-                  {currentStep?.rf_we
-                    ? `WRITE R${currentStep.rd_addr} = ${currentStep.rf_data}`
-                    : "rf_we = 0"}
-                </text>
+                    {/* BLOCK 2: Instruction Memory (512x16) */}
+                    <rect
+                      x="220"
+                      y="70"
+                      width="150"
+                      height="140"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={strokeActive}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="295"
+                      y="100"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      IMEM (512x16)
+                    </text>
+                    <text
+                      x="295"
+                      y="135"
+                      textAnchor="middle"
+                      fill="#60A5FA"
+                      fontSize="16"
+                      fontWeight="bold"
+                    >
+                      {currentStep?.ir || "0x0000"}
+                    </text>
+                    <text
+                      x="295"
+                      y="165"
+                      textAnchor="middle"
+                      fill="#E2E8F0"
+                      fontSize="11"
+                    >
+                      {currentStep?.decoded.disassembly || "NOP"}
+                    </text>
 
-                <rect
-                  x="920"
-                  y="70"
-                  width="150"
-                  height="150"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke={dpActive.isAlu ? "#2563EB" : "#475569"}
-                  strokeWidth="3"
-                />
-                <text
-                  x="995"
-                  y="100"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  8-Bit ALU
-                </text>
-                <text
-                  x="995"
-                  y="135"
-                  textAnchor="middle"
-                  fill="#38BDF8"
-                  fontSize="14"
-                  fontFamily="monospace"
-                >
-                  ZNCV: {reconstructed.flags}
-                </text>
-                <text x="995" y="170" textAnchor="middle" fill="#94A3B8" fontSize="11">
-                  ADD/SUB/AND/OR/XOR
-                </text>
+                    {/* BLOCK 3: Control Unit & 6-State FSM */}
+                    <rect
+                      x="440"
+                      y="70"
+                      width="140"
+                      height="140"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={strokeActive}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="510"
+                      y="98"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      DECODER & FSM
+                    </text>
+                    <text
+                      x="510"
+                      y="125"
+                      textAnchor="middle"
+                      fill="#F8FAFC"
+                      fontSize="12"
+                    >
+                      OP: {currentStep?.decoded.opcode_hex || "0x0"}
+                    </text>
+                    <text
+                      x="510"
+                      y="150"
+                      textAnchor="middle"
+                      fill="#34D399"
+                      fontSize="11"
+                    >
+                      wb_sel: {currentStep?.decoded.wb_sel || "--"}
+                    </text>
+                    <text
+                      x="510"
+                      y="175"
+                      textAnchor="middle"
+                      fill="#FBBF24"
+                      fontSize="11"
+                    >
+                      {currentStep?.decoded.cycles || 2} Cycles
+                    </text>
 
-                <rect
-                  x="410"
-                  y="320"
-                  width="260"
-                  height="120"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke={dpActive.isNn ? "#F59E0B" : "#475569"}
-                  strokeWidth="3"
-                />
-                <text
-                  x="540"
-                  y="350"
-                  textAnchor="middle"
-                  fill="#FBBF24"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  int8 NN Accelerator (0x50–0x5F)
-                </text>
-                <text
-                  x="540"
-                  y="380"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="12"
-                  fontFamily="monospace"
-                >
-                  ACC24: {reconstructed.nn.acc} | QOUT: {reconstructed.nn.qout}
-                </text>
-                <text
-                  x="540"
-                  y="408"
-                  textAnchor="middle"
-                  fill="#34D399"
-                  fontSize="12"
-                  fontFamily="monospace"
-                >
-                  LUT ACT: {reconstructed.nn.act} | MACs: {reconstructed.nn.mac_cnt}
-                </text>
+                    {/* BLOCK 4: 8x8 Register File */}
+                    <rect
+                      x="650"
+                      y="65"
+                      width="150"
+                      height="155"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={isWbActive ? "#10B981" : strokeActive}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="725"
+                      y="92"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      8x8 REG FILE
+                    </text>
+                    <text
+                      x="725"
+                      y="118"
+                      textAnchor="middle"
+                      fill="#E2E8F0"
+                      fontSize="11"
+                    >
+                      Rd: R{currentStep?.decoded.rd ?? 0} | Rs1: R
+                      {currentStep?.decoded.rs1 ?? 0}
+                    </text>
+                    <text
+                      x="725"
+                      y="142"
+                      textAnchor="middle"
+                      fill="#E2E8F0"
+                      fontSize="11"
+                    >
+                      Rs2: R{currentStep?.decoded.rs2 ?? 0}
+                    </text>
+                    <text
+                      x="725"
+                      y="175"
+                      textAnchor="middle"
+                      fill={isWbActive ? "#34D399" : "#64748B"}
+                      fontSize="12"
+                      fontWeight="bold"
+                    >
+                      {isWbActive
+                        ? `WE=1 (R${currentStep?.rd_addr}←${currentStep?.rf_data})`
+                        : "WE=0"}
+                    </text>
 
-                <rect
-                  x="700"
-                  y="320"
-                  width="190"
-                  height="110"
-                  rx="14"
-                  fill="#0F1624"
-                  stroke={dpActive.isMem ? "#10B981" : "#475569"}
-                  strokeWidth="3"
-                />
-                <text
-                  x="795"
-                  y="350"
-                  textAnchor="middle"
-                  fill="#E2E8F0"
-                  fontSize="13"
-                  fontWeight="bold"
-                >
-                  Data Memory (256×8)
-                </text>
-                <text
-                  x="795"
-                  y="385"
-                  textAnchor="middle"
-                  fill="#34D399"
-                  fontSize="12"
-                  fontFamily="monospace"
-                >
-                  {currentStep?.mem_we
-                    ? `ST [${currentStep.mem_addr}] ← ${currentStep.mem_data}`
-                    : "mem_we = 0"}
-                </text>
-              </svg>
-            </div>
+                    {/* BLOCK 5: 8-Bit ALU + ZNCV Flags */}
+                    <rect
+                      x="880"
+                      y="65"
+                      width="175"
+                      height="155"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={isAluOp ? strokeActive : strokeIdle}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="967"
+                      y="92"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      8-BIT ALU + FLAGS
+                    </text>
+                    <text
+                      x="967"
+                      y="125"
+                      textAnchor="middle"
+                      fill={isAluOp ? "#60A5FA" : "#64748B"}
+                      fontSize="14"
+                      fontWeight="bold"
+                    >
+                      {isAluOp ? currentStep?.decoded.disassembly : "IDLE"}
+                    </text>
+                    <text
+                      x="967"
+                      y="160"
+                      textAnchor="middle"
+                      fill="#34D399"
+                      fontSize="13"
+                    >
+                      ZNCV = {reconstructedState.flags}
+                    </text>
+
+                    {/* BLOCK 6: Data Memory (256x8) */}
+                    <rect
+                      x="460"
+                      y="270"
+                      width="190"
+                      height="115"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={isMemOp ? strokeActive : strokeIdle}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="555"
+                      y="298"
+                      textAnchor="middle"
+                      fill="#94A3B8"
+                      fontSize="11"
+                    >
+                      DATA MEM (256x8)
+                    </text>
+                    <text
+                      x="555"
+                      y="328"
+                      textAnchor="middle"
+                      fill={isMemOp ? "#F8FAFC" : "#64748B"}
+                      fontSize="12"
+                    >
+                      {isMemOp
+                        ? `Addr: ${currentStep?.mem_addr} | Data: ${currentStep?.mem_data}`
+                        : "No Memory Access"}
+                    </text>
+                    <text
+                      x="555"
+                      y="355"
+                      textAnchor="middle"
+                      fill="#38BDF8"
+                      fontSize="11"
+                    >
+                      mem_we = {currentStep?.mem_we ?? 0}
+                    </text>
+
+                    {/* BLOCK 7: int8 Neural Accelerator & Local I/O */}
+                    <rect
+                      x="860"
+                      y="270"
+                      width="195"
+                      height="115"
+                      rx="12"
+                      fill="#0F1624"
+                      stroke={isIoOp ? strokeActive : strokeIdle}
+                      strokeWidth="2.5"
+                    />
+                    <text
+                      x="957"
+                      y="298"
+                      textAnchor="middle"
+                      fill="#60A5FA"
+                      fontSize="11"
+                      fontWeight="bold"
+                    >
+                      I/O & int8 NN ACCEL
+                    </text>
+                    <text
+                      x="957"
+                      y="325"
+                      textAnchor="middle"
+                      fill="#E2E8F0"
+                      fontSize="11"
+                    >
+                      Port: {currentStep?.decoded.port || "0x00"} (
+                      {isIoOp
+                        ? currentStep?.decoded.io_dir
+                          ? "OUT"
+                          : "IN"
+                        : "IDLE"}
+                      )
+                    </text>
+                    <text
+                      x="957"
+                      y="352"
+                      textAnchor="middle"
+                      fill="#34D399"
+                      fontSize="11"
+                    >
+                      ACC: 0x
+                      {reconstructedState.nn.nnAcc
+                        .toString(16)
+                        .padStart(6, "0")
+                        .toUpperCase()}{" "}
+                      | ACT: 0x
+                      {reconstructedState.nn.nnAct
+                        .toString(16)
+                        .padStart(2, "0")
+                        .toUpperCase()}
+                    </text>
+                  </svg>
+                </div>
+              );
+            })()}
           </div>
         )}
 
+        {/* ================================================================
+            TAB 3: IN-BROWSER WAVEFORM VIEWER (FEATURE 3)
+           ================================================================ */}
         {activeTab === "waveform" && (
-          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-bold text-white flex items-center gap-2">
-                  <Activity className="w-5 h-5 text-blue-400" />
-                  Digital Timing Diagram & VCD Waveform Viewer
+                  <Radio className="w-5 h-5 text-blue-400" />
+                  Cycle-Accurate Hardware Timing Diagram Viewer (.VCD)
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Source:{" "}
-                  <span className="font-mono text-blue-400">{effectiveWaveform.source}</span>
+                  Renders curated signals from{" "}
+                  <code className="text-blue-300">
+                    build/waveform/dsd8_wave.vcd
+                  </code>{" "}
+                  (or live trace synthesis) across SYS, CPU, IO, and NN scopes.
                 </p>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                {["ALL", "CPU", "IO", "NN"].map((grp) => (
+                {(["ALL", "CPU", "IO", "NN"] as const).map((grp) => (
                   <button
                     key={grp}
                     onClick={() => setWaveGroupFilter(grp)}
-                    className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                    className={`px-3 py-1 rounded-lg text-xs font-mono transition ${
                       waveGroupFilter === grp
-                        ? "bg-[#2563EB] text-white"
+                        ? "bg-blue-600 text-white"
                         : "bg-[#090D16] text-slate-400 border border-slate-800"
                     }`}
                   >
@@ -1617,217 +1972,361 @@ export default function App() {
                   </button>
                 ))}
                 <button
-                  onClick={() => setWaveZoom((z) => Math.max(24, z - 8))}
-                  className="p-1.5 rounded-lg bg-slate-800 text-slate-200"
-                  title="Zoom Out"
+                  onClick={() => setWaveZoom((z) => Math.max(0.5, z - 0.5))}
+                  className="px-2.5 py-1 rounded bg-slate-800 text-xs font-mono"
                 >
-                  <ZoomOut className="w-4 h-4" />
+                  Zoom -
                 </button>
                 <button
-                  onClick={() => setWaveZoom((z) => Math.min(80, z + 8))}
-                  className="p-1.5 rounded-lg bg-slate-800 text-slate-200"
-                  title="Zoom In"
+                  onClick={() => setWaveZoom((z) => Math.min(4, z + 0.5))}
+                  className="px-2.5 py-1 rounded bg-slate-800 text-xs font-mono"
                 >
-                  <ZoomIn className="w-4 h-4" />
+                  Zoom +
                 </button>
                 <button
-                  onClick={() => loadVcdWaveform(true)}
-                  className="px-3 py-1.5 rounded-lg bg-blue-600/20 border border-blue-500/40 text-blue-300 text-xs font-medium"
+                  onClick={loadVcdWaveform}
+                  disabled={isLoadingVcd}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white"
                 >
-                  Run make waveform (.vcd)
+                  {isLoadingVcd ? "Generating VCD..." : "Run make waveform"}
                 </button>
               </div>
             </div>
 
-            <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#090D16]">
-              <div className="min-w-[800px]">
-                <div className="flex border-b border-slate-800 bg-slate-900/80 text-[10px] font-mono text-slate-400">
-                  <div className="w-48 shrink-0 p-2 border-r border-slate-800 font-semibold text-slate-300">
-                    Signal / Bus
-                  </div>
-                  <div className="flex">
-                    {effectiveWaveform.timestamps.map((ts, idx) => (
-                      <div
-                        key={idx}
-                        style={{ width: `${waveZoom}px` }}
-                        className="shrink-0 py-2 px-1 border-r border-slate-800/50 text-center"
-                      >
-                        {ts}ns
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {effectiveWaveform.signals
-                  .filter(
-                    (sig) =>
-                      waveGroupFilter === "ALL" || sig.group.toUpperCase() === waveGroupFilter
-                  )
-                  .map((sig) => (
-                    <div
-                      key={sig.id}
-                      className="flex border-b border-slate-800/60 items-center hover:bg-slate-900/40"
-                    >
-                      <div className="w-48 shrink-0 p-2 border-r border-slate-800 font-mono text-xs flex items-center justify-between">
-                        <span className="text-slate-200 truncate">{sig.name}</span>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-blue-400">
-                          {sig.group}
-                        </span>
-                      </div>
-                      <div className="flex items-center py-1.5">
-                        {sig.values.map((val, vIdx) => {
-                          if (sig.width === 1) {
-                            const isHigh = val === "1";
-                            return (
-                              <div
-                                key={vIdx}
-                                style={{ width: `${waveZoom}px` }}
-                                className="h-6 shrink-0 flex flex-col justify-between border-r border-slate-800/30"
-                              >
-                                <div
-                                  className={`h-full w-full ${
-                                    isHigh
-                                      ? "border-t-2 border-emerald-400 bg-emerald-500/10"
-                                      : "border-b-2 border-slate-600"
-                                  }`}
-                                />
-                              </div>
-                            );
-                          }
-                          return (
-                            <div
-                              key={vIdx}
-                              style={{ width: `${waveZoom}px` }}
-                              className="h-6 shrink-0 px-1 border-y border-r border-blue-500/40 bg-blue-950/20 flex items-center justify-center font-mono text-[10px] text-blue-300 truncate"
+            {/* Waveform Canvas */}
+            <div className="bg-[#090D16] border border-slate-800 rounded-xl p-4 overflow-x-auto">
+              {vcdData.signals && vcdData.signals.length > 0 ? (
+                <div
+                  className="space-y-2"
+                  style={{ minWidth: `${850 * waveZoom}px` }}
+                >
+                  {vcdData.signals
+                    .filter(
+                      (s) =>
+                        waveGroupFilter === "ALL" || s.group === waveGroupFilter
+                    )
+                    .map((sig) => {
+                      const maxT = Math.max(1, vcdData.max_time);
+                      return (
+                        <div
+                          key={sig.id}
+                          className="grid grid-cols-12 items-center border-b border-slate-800/60 pb-2"
+                        >
+                          <div className="col-span-3 pr-2 font-mono text-xs truncate">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 mr-1.5">
+                              {sig.group}
+                            </span>
+                            <span className="text-slate-200">{sig.name}</span>
+                            <span className="text-slate-500 text-[10px] ml-1">
+                              [{sig.width}b]
+                            </span>
+                          </div>
+                          <div className="col-span-9 h-8 bg-slate-950/80 rounded relative overflow-hidden border border-slate-800/60">
+                            <svg
+                              viewBox="0 0 1000 32"
+                              preserveAspectRatio="none"
+                              className="w-full h-full"
                             >
-                              {val}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-              </div>
-            </div>
-          </div>
-        )}
+                              {sig.transitions.map((tr, i) => {
+                                const nextT =
+                                  i < sig.transitions.length - 1
+                                    ? sig.transitions[i + 1].t
+                                    : maxT;
+                                const x1 = (tr.t / maxT) * 1000;
+                                const x2 = (nextT / maxT) * 1000;
+                                const isBit = sig.width === 1;
+                                const yHigh = 6;
+                                const yLow = 26;
 
-        {activeTab === "nn" && (
-          <div className="flex flex-col gap-6">
-            <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl">
-              <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
-                <div>
-                  <h2 className="text-base font-bold text-white flex items-center gap-2">
-                    <BrainCircuit className="w-5 h-5 text-blue-400" />
-                    4–6–3 Quantized Iris MLP — Certified Cycle Benchmark (95.65% Accuracy, 22/23)
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Load any of the 23 quantized test samples across software baselines (b0, b1) and
-                    hardware-accelerated variants (a0, a2, a4)
-                  </p>
+                                if (isBit) {
+                                  const y = tr.v === "1" ? yHigh : yLow;
+                                  return (
+                                    <g key={i}>
+                                      <line
+                                        x1={x1}
+                                        y1={y}
+                                        x2={x2}
+                                        y2={y}
+                                        stroke={
+                                          tr.v === "1" ? "#34D399" : "#475569"
+                                        }
+                                        strokeWidth="2"
+                                      />
+                                      {i > 0 && (
+                                        <line
+                                          x1={x1}
+                                          y1={yHigh}
+                                          x2={x1}
+                                          y2={yLow}
+                                          stroke="#34D399"
+                                          strokeWidth="1.5"
+                                        />
+                                      )}
+                                    </g>
+                                  );
+                                } else {
+                                  return (
+                                    <g key={i}>
+                                      <rect
+                                        x={x1}
+                                        y={4}
+                                        width={Math.max(2, x2 - x1)}
+                                        height={24}
+                                        fill="#1E293B"
+                                        stroke="#2563EB"
+                                        strokeWidth="1"
+                                      />
+                                      {x2 - x1 > 35 && (
+                                        <text
+                                          x={x1 + 4}
+                                          y={20}
+                                          fill="#93C5FD"
+                                          fontSize="10"
+                                          fontFamily="monospace"
+                                        >
+                                          {tr.v}
+                                        </text>
+                                      )}
+                                    </g>
+                                  );
+                                }
+                              })}
+                            </svg>
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <select
-                    value={selectedSample}
-                    onChange={(e) => setSelectedSample(Number(e.target.value))}
-                    className="bg-[#090D16] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white"
-                  >
-                    {nnSamples.map((s) => (
-                      <option key={s.index} value={s.index}>
-                        Sample s{String(s.index).padStart(2, "0")} — {s.class_name} [
-                        {s.features.join(", ")}]
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    value={selectedVariant}
-                    onChange={(e) => setSelectedVariant(e.target.value)}
-                    className="bg-[#090D16] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono"
-                  >
-                    <option value="a4">a4 (Unrolled HW MAC + LUT — 1,087 cyc)</option>
-                    <option value="a2">a2 (Looped HW MAC + LUT — 2,071 cyc)</option>
-                    <option value="a0">a0 (Looped HW MAC + SW Act — 2,172 cyc)</option>
-                    <option value="b1">b1 (Shift-Add SW Baseline — 24,427 cyc)</option>
-                    <option value="b0">b0 (Repeated-Add SW Baseline — 43,155 cyc)</option>
-                  </select>
-                  <button
-                    onClick={() => loadSampleVariantAsm(selectedSample, selectedVariant)}
-                    className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white text-xs font-semibold"
-                  >
-                    Load & Simulate in CPU Debugger
-                  </button>
-                </div>
-              </div>
-
-              <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#090D16]">
-                <table className="w-full text-left text-xs font-mono">
-                  <thead className="bg-slate-900 text-slate-400">
-                    <tr>
-                      <th className="p-3">Variant</th>
-                      <th className="p-3">Implementation Strategy</th>
-                      <th className="p-3">Mean Cycles</th>
-                      <th className="p-3">Min..Max</th>
-                      <th className="p-3">Speedup vs b0</th>
-                      <th className="p-3">Speedup vs b1</th>
-                      <th className="p-3">Max IMEM Words</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {BENCHMARK_ROWS.map((row) => (
-                      <tr key={row.variant} className="border-t border-slate-800/70">
-                        <td className="p-3 font-bold text-blue-400">{row.variant}</td>
-                        <td className="p-3 font-sans text-slate-200">{row.desc}</td>
-                        <td className="p-3 text-white font-bold">{row.mean.toLocaleString()}</td>
-                        <td className="p-3 text-slate-400">
-                          {row.min.toLocaleString()}..{row.max.toLocaleString()}
-                        </td>
-                        <td className="p-3 text-emerald-400 font-bold">{row.speedupB0}</td>
-                        <td className="p-3 text-amber-400 font-bold">{row.speedupB1}</td>
-                        <td className="p-3 text-slate-300">{row.maxInstr} / 512</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {benchMd && (
-                <div className="mt-4 flex justify-end">
-                  <button
-                    onClick={() => downloadArtifact("bench.md", benchMd)}
-                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5"
-                  >
-                    <Download className="w-3.5 h-3.5 text-blue-400" /> Download Raw bench.md
-                  </button>
+              ) : (
+                <div className="text-center py-8 text-xs font-mono text-slate-400">
+                  Click "Run make waveform" above to compile RTL with Icarus
+                  Verilog and render{" "}
+                  <code className="text-blue-400">
+                    build/waveform/dsd8_wave.vcd
+                  </code>
+                  .
                 </div>
               )}
             </div>
           </div>
         )}
 
-        {activeTab === "wizard" && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-5 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 flex flex-col gap-4 shadow-xl">
-              <h2 className="text-base font-bold text-white flex items-center gap-2">
-                <Sparkles className="w-5 h-5 text-blue-400" />
-                int8 Quantization & Custom Inference Wizard
-              </h2>
-              <p className="text-xs text-slate-400">
-                Tune fixed-point arithmetic right-shifts (NN_SHIFT) and LUT activation banks, or
-                test custom quantized 4-feature Iris inputs.
-              </p>
+        {/* ================================================================
+            TAB 4: NN ACCELERATOR BENCHMARK DASHBOARD
+           ================================================================ */}
+        {activeTab === "nn" && (
+          <div className="space-y-5">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
+                <div className="text-xs text-slate-400">Topology & Dataset</div>
+                <div className="text-xl font-bold text-white mt-1">
+                  4 → 6 → 3 MLP (Iris)
+                </div>
+                <div className="text-xs text-blue-400 mt-1 font-mono">
+                  int8 Weights + 24-bit Accumulator
+                </div>
+              </div>
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
+                <div className="text-xs text-slate-400">
+                  Classification Accuracy
+                </div>
+                <div className="text-xl font-bold text-emerald-400 mt-1">
+                  22 / 23 (95.65%)
+                </div>
+                <div className="text-xs text-slate-400 mt-1 font-mono">
+                  Bit-exact across Python, Sim & RTL
+                </div>
+              </div>
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
+                <div className="text-xs text-slate-400">
+                  Max Hardware Speedup (a4)
+                </div>
+                <div className="text-xl font-bold text-blue-400 mt-1">
+                  39.7× vs b0 (22.5× vs b1)
+                </div>
+                <div className="text-xs text-slate-400 mt-1 font-mono">
+                  43,155 cycles → 1,087 cycles
+                </div>
+              </div>
+              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
+                <div className="text-xs text-slate-400">
+                  RTL Conformance Matrix
+                </div>
+                <div className="text-xl font-bold text-amber-300 mt-1">
+                  230 / 230 PASS
+                </div>
+                <div className="text-xs text-slate-400 mt-1 font-mono">
+                  23 samples × 5 variants × 2 modes
+                </div>
+              </div>
+            </div>
 
-              <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              <div className="lg:col-span-7 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 space-y-4">
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-300">
+                  Certified Cycle & Speedup Comparison (23 Held-Out Iris Samples)
+                </h2>
+                <div className="space-y-3">
+                  {certifiedMetrics.map((m) => {
+                    const widthPct = Math.max(
+                      4,
+                      Math.round((m.mean_cycles / 43155) * 100)
+                    );
+                    const isAccel = m.variant.startsWith("a");
+                    return (
+                      <div
+                        key={m.variant}
+                        className="bg-[#090D16] border border-slate-800 rounded-xl p-3 space-y-2"
+                      >
+                        <div className="flex justify-between items-center text-xs">
+                          <div>
+                            <span className="font-mono font-bold uppercase px-2 py-0.5 rounded bg-blue-600/20 text-blue-400 mr-2">
+                              {m.variant}
+                            </span>
+                            <span className="font-semibold text-slate-200">
+                              {m.title}
+                            </span>
+                          </div>
+                          <div className="font-mono text-xs">
+                            <span className="text-slate-400 mr-3">
+                              Mean:{" "}
+                              <strong className="text-white">
+                                {m.mean_cycles.toLocaleString()}
+                              </strong>{" "}
+                              cyc
+                            </span>
+                            <span className="text-emerald-400 font-bold">
+                              {m.speedup_b0}× vs b0
+                            </span>
+                          </div>
+                        </div>
+                        <div className="w-full h-2.5 bg-slate-900 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full ${
+                              isAccel ? "bg-blue-500" : "bg-slate-600"
+                            }`}
+                            style={{ width: `${widthPct}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="lg:col-span-5 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 flex flex-col justify-between space-y-4">
+                <div className="space-y-3">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-300">
+                    Interactive Iris Sample Launcher
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Select any of the 23 quantized test samples and an
+                    implementation variant (`b0`, `b1`, `a0`, `a2`, `a4`) to
+                    load its generated assembly directly into the CPU debugger.
+                  </p>
+
+                  <div className="space-y-2">
+                    <label className="text-xs text-slate-400 block">
+                      Test Sample (s00 – s22)
+                    </label>
+                    <select
+                      value={selectedSampleIdx}
+                      onChange={(e) =>
+                        setSelectedSampleIdx(Number(e.target.value))
+                      }
+                      className="w-full bg-[#090D16] border border-slate-700 rounded-xl px-3 py-2 text-xs font-mono text-slate-200"
+                    >
+                      {nnSamples.map((s) => (
+                        <option key={s.index} value={s.index}>
+                          {s.sample_id.toUpperCase()} — Features: [
+                          {Array.isArray(s.features)
+                            ? s.features.join(", ")
+                            : String(s.features ?? "")}
+                          ] → Expected: {s.class_name} ({s.expected_class})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs text-slate-400 block">
+                      Implementation Variant
+                    </label>
+                    <div className="grid grid-cols-5 gap-2">
+                      {["b0", "b1", "a0", "a2", "a4"].map((v) => (
+                        <button
+                          key={v}
+                          onClick={() => setSelectedVariant(v)}
+                          className={`py-2 rounded-xl font-mono text-xs font-bold uppercase border transition ${
+                            selectedVariant === v
+                              ? "bg-blue-600 text-white border-blue-500"
+                              : "bg-[#090D16] text-slate-400 border-slate-800 hover:text-slate-200"
+                          }`}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() =>
+                    loadAndRunNnSample(selectedSampleIdx, selectedVariant)
+                  }
+                  className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  Load s{selectedSampleIdx.toString().padStart(2, "0")}_
+                  {selectedVariant}.asm into CPU Workbench
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ================================================================
+            TAB 5: CUSTOM NEURAL NETWORK QUANTIZATION WIZARD (FEATURE 5)
+           ================================================================ */}
+        {activeTab === "wizard" && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            <div className="lg:col-span-5 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 space-y-4 shadow-xl">
+              <div>
+                <h2 className="text-base font-bold text-white flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-blue-400" />
+                  Custom int8 Neural Network Quantization Wizard
+                </h2>
+                <p className="text-xs text-slate-400 mt-1">
+                  Customize 4 signed int8 Iris input features, requantization
+                  right-shifts (`NN_SHIFT`), and hardware activation LUT bank
+                  (`NN_LUT_SEL`).
+                </p>
+              </div>
+
+              <div className="space-y-3">
                 {[
-                  "Sepal Length (X0)",
-                  "Sepal Width (X1)",
-                  "Petal Length (X2)",
-                  "Petal Width (X3)",
+                  "Sepal Length (x0)",
+                  "Sepal Width (x1)",
+                  "Petal Length (x2)",
+                  "Petal Width (x3)",
                 ].map((label, idx) => (
-                  <div key={label} className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
-                    <label className="text-[11px] text-slate-400 block mb-1">{label}</label>
+                  <div
+                    key={idx}
+                    className="bg-[#090D16] border border-slate-800 rounded-xl p-3"
+                  >
+                    <div className="flex justify-between text-xs font-mono mb-1">
+                      <span className="text-slate-300">{label}</span>
+                      <span className="text-blue-400 font-bold">
+                        {customFeatures[idx]} (0x
+                        {(customFeatures[idx] & 0xff)
+                          .toString(16)
+                          .padStart(2, "0")
+                          .toUpperCase()}
+                        )
+                      </span>
+                    </div>
                     <input
-                      type="number"
+                      type="range"
                       min={-128}
                       max={127}
                       value={customFeatures[idx]}
@@ -1836,16 +2335,16 @@ export default function App() {
                         next[idx] = Number(e.target.value);
                         setCustomFeatures(next);
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-sm text-white"
+                      className="w-full accent-blue-600"
                     />
                   </div>
                 ))}
               </div>
 
               <div className="grid grid-cols-3 gap-3">
-                <div className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
-                  <label className="text-[11px] text-slate-400 block mb-1">
-                    Layer 1 Shift (0..15)
+                <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                  <label className="text-[11px] font-mono text-slate-400 block">
+                    Layer-1 Shift
                   </label>
                   <input
                     type="number"
@@ -1853,12 +2352,12 @@ export default function App() {
                     max={15}
                     value={customShift1}
                     onChange={(e) => setCustomShift1(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 font-mono text-sm text-white"
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono"
                   />
                 </div>
-                <div className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
-                  <label className="text-[11px] text-slate-400 block mb-1">
-                    Layer 2 Shift (0..15)
+                <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                  <label className="text-[11px] font-mono text-slate-400 block">
+                    Layer-2 Shift
                   </label>
                   <input
                     type="number"
@@ -1866,17 +2365,17 @@ export default function App() {
                     max={15}
                     value={customShift2}
                     onChange={(e) => setCustomShift2(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 font-mono text-sm text-white"
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono"
                   />
                 </div>
-                <div className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
-                  <label className="text-[11px] text-slate-400 block mb-1">
+                <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                  <label className="text-[11px] font-mono text-slate-400 block">
                     LUT Bank (0x58)
                   </label>
                   <select
                     value={customLutBank}
                     onChange={(e) => setCustomLutBank(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white"
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono"
                   >
                     <option value={0}>0: ReLU</option>
                     <option value={1}>1: Sigmoid</option>
@@ -1886,255 +2385,340 @@ export default function App() {
                 </div>
               </div>
 
-              <button
-                onClick={runCustomWizardInference}
-                className="w-full py-2.5 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white font-semibold text-xs shadow-lg shadow-blue-600/25 cursor-pointer"
-              >
-                Run Hardware-Accurate int8 Inference
-              </button>
-
-              {customNnResult && (
-                <div className="bg-[#090D16] border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-400">Predicted Iris Species:</span>
-                    <span className="text-sm font-bold text-emerald-400">
-                      {customNnResult.predicted_name} (Class {customNnResult.predicted_class})
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs font-mono text-slate-300">
-                    <span>Executed MACs: {customNnResult.mac_count}</span>
-                    <span>Zero-Skips: {customNnResult.skip_count}</span>
-                    <span className="text-blue-400">Sparsity: {customNnResult.sparsity_pct}%</span>
-                  </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={runCustomInference}
+                  className="flex-1 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white cursor-pointer"
+                >
+                  Evaluate Quantized Network
+                </button>
+                {customNnResult?.generated_asm && (
                   <button
                     onClick={() => {
                       setAsmCode(customNnResult.generated_asm);
                       setUseNnSim(true);
-                      setActiveTab("cpu");
-                      runSimulation(customNnResult.generated_asm, true);
+                      setActiveTab("ide");
+                      runSimulation(
+                        customNnResult.generated_asm,
+                        true,
+                        switchBits,
+                        buttonBits
+                      );
                     }}
-                    className="mt-2 w-full py-2 rounded-lg bg-emerald-600/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-600/30 text-xs font-semibold"
+                    className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white cursor-pointer"
                   >
-                    Load Generated Custom Assembly into CPU Simulator →
+                    Load Generated ASM in IDE
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
-            <div className="lg:col-span-7 flex flex-col gap-5">
-              {customNnResult && (
-                <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 flex flex-col gap-4">
-                  <h3 className="text-sm font-bold text-white">
-                    Hidden Layer 1 (6 Neurons) — 24-Bit ACC → Requantized QOUT → LUT Activation
-                  </h3>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 font-mono text-xs">
-                    {customNnResult.layer1_acc.map((accVal, idx) => (
-                      <div
-                        key={idx}
-                        className="bg-[#090D16] p-3 rounded-xl border border-slate-800"
-                      >
-                        <div className="text-slate-400 text-[11px]">Hidden Neuron H{idx}</div>
-                        <div className="text-blue-400 mt-1">ACC24: {accVal}</div>
-                        <div className="text-slate-300">
-                          QOUT (&gt;&gt;{customNnResult.shift1}): {customNnResult.layer1_qout[idx]}
-                        </div>
-                        <div className="text-emerald-400 font-bold">
-                          LUT ACT: {customNnResult.layer1_act[idx]}
-                        </div>
+            <div className="lg:col-span-7 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 space-y-4 shadow-xl">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">
+                Hardware Co-Processor Layer-by-Layer Inspection
+              </h3>
+              {customNnResult ? (
+                <div className="space-y-4 font-mono text-xs">
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                      <div className="text-slate-400 text-[10px]">
+                        PREDICTED CLASS
                       </div>
-                    ))}
+                      <div className="text-base font-bold text-emerald-400 mt-1">
+                        {customNnResult.predicted_class_name} (
+                        {customNnResult.predicted_class})
+                      </div>
+                    </div>
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                      <div className="text-slate-400 text-[10px]">
+                        NONZERO MAC OPS
+                      </div>
+                      <div className="text-base font-bold text-blue-400 mt-1">
+                        {customNnResult.mac_ops} MACs
+                      </div>
+                    </div>
+                    <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3">
+                      <div className="text-slate-400 text-[10px]">
+                        ZERO-SKIP SAVED
+                      </div>
+                      <div className="text-base font-bold text-amber-400 mt-1">
+                        {customNnResult.zero_skips} Skips
+                      </div>
+                    </div>
                   </div>
 
-                  <h3 className="text-sm font-bold text-white pt-2">
-                    Output Layer 2 (3 Iris Classes) — Final Logit Scores
-                  </h3>
-                  <div className="grid grid-cols-3 gap-3 font-mono text-xs">
-                    {["0: Iris-setosa", "1: Iris-versicolor", "2: Iris-virginica"].map(
-                      (cname, idx) => {
-                        const isWinner = customNnResult.predicted_class === idx;
-                        return (
+                  <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3 space-y-2">
+                    <div className="text-slate-400 text-[11px]">
+                      Hidden Layer (6 Neurons): 24-bit ACC → QOUT (&gt;&gt;
+                      {customNnResult.shift1}) → LUT Activation
+                    </div>
+                    <div className="grid grid-cols-6 gap-2 text-center">
+                      {customNnResult.hidden_act?.map(
+                        (actVal: number, idx: number) => (
                           <div
-                            key={cname}
-                            className={`p-3 rounded-xl border ${
-                              isWinner
-                                ? "bg-emerald-950/40 border-emerald-500/60"
-                                : "bg-[#090D16] border-slate-800"
-                            }`}
+                            key={idx}
+                            className="bg-slate-900 border border-slate-800 rounded-lg p-2"
                           >
-                            <div className="text-[11px] text-slate-300 font-sans font-semibold">
-                              {cname}
+                            <div className="text-[10px] text-slate-500">
+                              H{idx}
                             </div>
-                            <div className="text-slate-400 mt-1">
-                              ACC24: {customNnResult.layer2_acc[idx]}
+                            <div className="text-[10px] text-slate-400">
+                              ACC:{customNnResult.hidden_acc[idx]}
                             </div>
-                            <div className="text-base font-bold text-white mt-0.5">
-                              Score: {customNnResult.layer2_scores[idx]}
+                            <div className="text-emerald-400 font-bold mt-0.5">
+                              ACT: {actVal}
                             </div>
                           </div>
-                        );
-                      }
-                    )}
+                        )
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="bg-[#090D16] border border-slate-800 rounded-xl p-3 space-y-2">
+                    <div className="text-slate-400 text-[11px]">
+                      Output Layer Logits (3 Iris Classes)
+                    </div>
+                    <div className="grid grid-cols-3 gap-3">
+                      {customNnResult.out_logits?.map(
+                        (logit: number, idx: number) => (
+                          <div
+                            key={idx}
+                            className={`rounded-xl p-2.5 border ${
+                              idx === customNnResult.predicted_class
+                                ? "bg-emerald-950/40 border-emerald-500 text-emerald-300"
+                                : "bg-slate-900 border-slate-800 text-slate-300"
+                            }`}
+                          >
+                            <div className="text-[10px]">Class {idx}</div>
+                            <div className="text-sm font-bold">
+                              Logit: {logit} (ACC: {customNnResult.out_acc[idx]})
+                            </div>
+                          </div>
+                        )
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-slate-400 text-[11px] mb-1">
+                      Auto-Generated DSD-8 Assembly Preview:
+                    </div>
+                    <pre className="bg-[#090D16] border border-slate-800 rounded-xl p-3 text-[11px] text-blue-300 max-h-[170px] overflow-auto">
+                      {customNnResult.generated_asm}
+                    </pre>
                   </div>
                 </div>
-              )}
+              ) : null}
+            </div>
+          </div>
+        )}
 
-              <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                  Hardware Activation LUT Sample Table (Ports 0x58–0x5B)
-                </h3>
-                <div className="text-xs text-slate-400 font-mono grid grid-cols-4 gap-2">
-                  {Object.entries(lutsData).map(([bankName, vals]) => (
+        {/* ================================================================
+            TAB 6: AUTOMATED TEST SUITE RUNNER & ARTIFACT EXPORT (FEATURES 4 & 6)
+           ================================================================ */}
+        {activeTab === "verify" && (
+          <div className="space-y-5">
+            {/* Feature 4: One-Click Unit Test & Conformance Matrix */}
+            <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-bold text-white flex items-center gap-2">
+                    <ShieldCheck className="w-5 h-5 text-blue-400" />
+                    Automated Hardware Testbench & Conformance Runner
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Execute individual Verilog unit testbenches (`tb_alu`,
+                    `tb_nn_accel`, `tb_cpu`) and golden trace conformance checks.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                {[
+                  { key: "lint", label: "make lint", desc: "Verilator + Icarus" },
+                  {
+                    key: "tb_alu",
+                    label: "tb_alu.v",
+                    desc: "ALU Unit Testbench",
+                  },
+                  {
+                    key: "tb_nn",
+                    label: "tb_nn_accel.v",
+                    desc: "NN MAC/LUT Testbench",
+                  },
+                  {
+                    key: "tb_cpu",
+                    label: "make test",
+                    desc: "Directed CPU Tests",
+                  },
+                  {
+                    key: "conformance",
+                    label: "make conformance",
+                    desc: "Golden vs RTL Trace",
+                  },
+                ].map((item) => {
+                  const res = suiteResults[item.key];
+                  const isRunning = runningTarget === item.key;
+                  return (
                     <div
-                      key={bankName}
-                      className="bg-[#090D16] p-2.5 rounded-xl border border-slate-800"
+                      key={item.key}
+                      className="bg-[#090D16] border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between gap-3"
                     >
-                      <div className="text-blue-400 font-bold mb-1">{bankName}</div>
-                      <div>f(-32) = {vals[224]}</div>
-                      <div>f(0) = {vals[0]}</div>
-                      <div>f(+32) = {vals[32]}</div>
-                      <div>f(+64) = {vals[64]}</div>
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-xs font-bold text-white">
+                            {item.label}
+                          </span>
+                          {res &&
+                            (res.passed ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-red-400" />
+                            ))}
+                        </div>
+                        <div className="text-[11px] text-slate-400 mt-1">
+                          {item.desc}
+                        </div>
+                        {res && (
+                          <div
+                            className={`text-[10px] font-mono mt-2 ${
+                              res.passed ? "text-emerald-400" : "text-red-400"
+                            }`}
+                          >
+                            {res.passed ? "PASSED" : "FAILED"} in{" "}
+                            {res.elapsed_sec}s
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => runSuiteTarget(item.key)}
+                        disabled={isRunning}
+                        className="w-full py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-mono transition cursor-pointer"
+                      >
+                        {isRunning ? "Running..." : "Run Target"}
+                      </button>
                     </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Feature 6: Report & Artifact Export Engine */}
+            <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                <FileSpreadsheet className="w-4 h-4 text-blue-400" />
+                Artifact & Lab Report Export Center
+              </h3>
+              <div className="flex flex-wrap gap-2.5">
+                <button
+                  onClick={() => downloadTextFile("program.asm", asmCode)}
+                  className="px-3.5 py-2 rounded-xl bg-[#090D16] hover:bg-slate-800 border border-slate-700 text-xs font-mono flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5 text-blue-400" /> Download .ASM
+                </button>
+                <button
+                  onClick={() =>
+                    downloadTextFile("program.hex", hexOutput || "; Empty")
+                  }
+                  className="px-3.5 py-2 rounded-xl bg-[#090D16] hover:bg-slate-800 border border-slate-700 text-xs font-mono flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-400" /> Download
+                  .HEX
+                </button>
+                <button
+                  onClick={() =>
+                    downloadTextFile(
+                      "program.lst",
+                      listingOutput || "; Empty"
+                    )
+                  }
+                  className="px-3.5 py-2 rounded-xl bg-[#090D16] hover:bg-slate-800 border border-slate-700 text-xs font-mono flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5 text-amber-400" /> Download
+                  .LST
+                </button>
+                <button
+                  onClick={() =>
+                    downloadTextFile(
+                      "golden.trace",
+                      rawTraceOutput || "# Run simulation first"
+                    )
+                  }
+                  className="px-3.5 py-2 rounded-xl bg-[#090D16] hover:bg-slate-800 border border-slate-700 text-xs font-mono flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5 text-purple-400" /> Download
+                  Golden .TRACE
+                </button>
+                {benchMarkdown && (
+                  <button
+                    onClick={() => downloadTextFile("bench.md", benchMarkdown)}
+                    className="px-3.5 py-2 rounded-xl bg-[#090D16] hover:bg-slate-800 border border-slate-700 text-xs font-mono flex items-center gap-1.5"
+                  >
+                    <Download className="w-3.5 h-3.5 text-pink-400" /> Download
+                    bench.md Report
+                  </button>
+                )}
+                <button
+                  onClick={() => window.print()}
+                  className="px-3.5 py-2 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/40 text-blue-300 text-xs font-mono flex items-center gap-1.5"
+                >
+                  Print / Save PDF Verification Report
+                </button>
+              </div>
+            </div>
+
+            {/* Real-Time SSE Streaming Terminal */}
+            <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-blue-400" />
+                  <span className="text-sm font-bold">
+                    Live Toolchain & Makefile Streaming Console (SSE)
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    { key: "lint", label: "make lint" },
+                    { key: "test", label: "make test" },
+                    { key: "conformance", label: "make conformance" },
+                    { key: "waveform", label: "make waveform" },
+                    { key: "nn_ref", label: "python3 nn/nn_ref.py" },
+                    { key: "nn_rtl", label: "make nn" },
+                    { key: "bench", label: "make bench" },
+                  ].map((cmd) => (
+                    <button
+                      key={cmd.key}
+                      disabled={isRunningCmd}
+                      onClick={() => runStreamCommand(cmd.key)}
+                      className="px-2.5 py-1 rounded-lg bg-[#090D16] hover:bg-blue-600 text-xs font-mono text-slate-300 hover:text-white border border-slate-800 transition disabled:opacity-40"
+                    >
+                      $ {cmd.label}
+                    </button>
                   ))}
                 </div>
               </div>
-            </div>
-          </div>
-        )}
 
-        {activeTab === "verify" && (
-          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h2 className="text-base font-bold text-white flex items-center gap-2">
-                  <ShieldCheck className="w-5 h-5 text-blue-400" />
-                  Automated Hardware Unit Test & Golden Conformance Suite
-                </h2>
-                <p className="text-xs text-slate-400">
-                  Run Icarus Verilog testbenches (tb_alu, tb_nn_accel, tb_cpu), Golden Conformance,
-                  and Verilator Lint directly in the browser.
-                </p>
-              </div>
-              <button
-                onClick={async () => {
-                  for (const key of ["lint", "tb_alu", "tb_nn", "tb_cpu", "conformance"]) {
-                    await runSingleTestTarget(key);
-                  }
-                }}
-                disabled={runningTestKey !== null}
-                className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/25 cursor-pointer"
-              >
-                {runningTestKey ? `Running ${runningTestKey}...` : "Run Full Verification Suite"}
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {[
-                { key: "lint", title: "Verilator Strict RTL Lint (make lint)" },
-                { key: "tb_alu", title: "8-Bit ALU Exhaustive Unit Testbench (tb_alu.v)" },
-                {
-                  key: "tb_nn",
-                  title: "int8 NN Accelerator Unit Testbench (tb_nn_accel.v)",
-                },
-                { key: "tb_cpu", title: "Full CPU + Peripherals RTL Testbench (make test)" },
-                {
-                  key: "conformance",
-                  title: "Golden Assembler & Simulator Conformance (make conformance)",
-                },
-              ].map((item) => {
-                const res = testResults[item.key];
-                const isRunning = runningTestKey === item.key;
-                return (
-                  <div
-                    key={item.key}
-                    className="bg-[#090D16] border border-slate-800 rounded-xl p-4 flex flex-col gap-3"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold text-white">{item.title}</span>
-                      <div className="flex items-center gap-2">
-                        {res && (
-                          <span
-                            className={`flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded-full ${
-                              res.passed
-                                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-                                : "bg-red-500/20 text-red-300 border border-red-500/40"
-                            }`}
-                          >
-                            {res.passed ? (
-                              <CheckCircle className="w-3.5 h-3.5" />
-                            ) : (
-                              <XCircle className="w-3.5 h-3.5" />
-                            )}
-                            {res.passed ? "PASS" : "FAIL"} ({res.duration_ms}ms)
-                          </span>
-                        )}
-                        <button
-                          onClick={() => runSingleTestTarget(item.key)}
-                          disabled={isRunning}
-                          className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200"
-                        >
-                          {isRunning ? "Running..." : "Run"}
-                        </button>
-                      </div>
+              <div className="bg-[#090D16] border border-slate-800 rounded-xl p-4 h-[340px] overflow-auto font-mono text-xs space-y-1">
+                {consoleLogs.map((line, i) => {
+                  const isPass = line.includes("PASS") || line.includes("SUCCESS");
+                  const isFail = line.includes("FAIL") || line.includes("ERROR");
+                  return (
+                    <div
+                      key={i}
+                      className={
+                        isPass
+                          ? "text-emerald-400 font-semibold"
+                          : isFail
+                          ? "text-red-400 font-semibold"
+                          : "text-slate-300"
+                      }
+                    >
+                      {line}
                     </div>
-                    {res && (
-                      <pre className="text-[11px] font-mono text-slate-300 bg-slate-950 p-3 rounded-lg max-h-40 overflow-y-auto whitespace-pre-wrap">
-                        {res.log}
-                      </pre>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {activeTab === "toolchain" && (
-          <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-base font-bold text-white flex items-center gap-2">
-                <Terminal className="w-5 h-5 text-blue-400" />
-                Live Hardware Toolchain Console (Server-Sent Events)
-              </h2>
-              <div className="flex flex-wrap gap-2">
-                {[
-                  { key: "lint", label: "make lint" },
-                  { key: "test", label: "make test" },
-                  { key: "conformance", label: "make conformance" },
-                  { key: "waveform", label: "make waveform" },
-                  { key: "nn_ref", label: "nn_ref.py" },
-                  { key: "nn_build", label: "make nn" },
-                  { key: "bench", label: "make bench" },
-                ].map((btn) => (
-                  <button
-                    key={btn.key}
-                    onClick={() => runStreamCommand(btn.key)}
-                    disabled={isRunningCmd}
-                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-blue-600 text-xs font-mono text-slate-200 hover:text-white transition-colors disabled:opacity-40 cursor-pointer"
-                  >
-                    $ {btn.label}
-                  </button>
-                ))}
+                  );
+                })}
+                <div ref={consoleEndRef} />
               </div>
-            </div>
-
-            <div className="bg-[#090D16] border border-slate-800 rounded-xl p-4 font-mono text-xs text-slate-300 h-[440px] overflow-y-auto whitespace-pre-wrap">
-              {consoleLines.map((ln, idx) => (
-                <div
-                  key={idx}
-                  className={
-                    ln.includes("PASS")
-                      ? "text-emerald-400"
-                      : ln.includes("FAIL") || ln.includes("Error")
-                      ? "text-red-400"
-                      : ln.startsWith("$")
-                      ? "text-blue-400 font-bold"
-                      : ""
-                  }
-                >
-                  {ln}
-                </div>
-              ))}
-              <div ref={consoleEndRef} />
             </div>
           </div>
         )}
