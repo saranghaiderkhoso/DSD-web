@@ -118,7 +118,7 @@ export default function App() {
       setFinalState(data.final_state || null);
       setCurrentStepIdx(0);
     } catch (err: any) {
-      setSimError("Could not reach FastAPI backend at http://localhost:8000");
+      setSimError("Backend request error: ");
     }
   };
 
