@@ -1,18 +1,22 @@
-import os
-import sys
-import re
+import asyncio
 import json
+import os
+import re
 import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="DSD-8 Local Hardware Simulator API")
+app = FastAPI(title="DSD-8 Studio Backend API", version="2.0.0")
 
-# Enable CORS for local React development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,283 +25,484 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Points to the root of your DSD-8 project (one folder up from /backend)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+WEIGHTS_PATH = PROJECT_ROOT / "nn" / "data" / "weights_q.json"
+BENCH_MD_PATH = PROJECT_ROOT / "build" / "nn" / "bench.md"
+VCD_PATH = PROJECT_ROOT / "build" / "waveform" / "dsd8_wave.vcd"
+TESTS_NN_DIR = PROJECT_ROOT / "tests" / "nn"
 
-class FileUpdate(BaseModel):
-    path: str
-    content: str
 
-class CustomAssembleRequest(BaseModel):
+class SimRequest(BaseModel):
     asm_code: str
     use_nn_sim: bool = True
     switches: str = "0x00"
     buttons: str = "0x00"
+    max_instrs: int = 50000
+    breakpoint_pc: Optional[int] = None
 
-# -------------------------------------------------------------------------
-# Helper: 16-Bit Instruction Disassembler & Internal Micro-Op Explainer
-# -------------------------------------------------------------------------
-COND_MAP = {
-    0: ("BEQ", "Z == 1"),
-    1: ("BNE", "Z == 0"),
-    2: ("BCS", "C == 1"),
-    3: ("BCC", "C == 0"),
-    4: ("BMI", "N == 1"),
-    5: ("BPL", "N == 0"),
-    6: ("BVS", "V == 1"),
-    7: ("BVC", "V == 0"),
+
+class CustomNNRequest(BaseModel):
+    features: List[int]  # 4 int8 features [x0, x1, x2, x3]
+    shift1: Optional[int] = None
+    shift2: Optional[int] = None
+    lut_bank: int = 0
+
+
+OPCODE_MNEMONICS = {
+    0x0: "NOP",
+    0x1: "LDI",
+    0x2: "LD",
+    0x3: "ST",
+    0x4: "ADD",
+    0x5: "SUB",
+    0x6: "AND",
+    0x7: "OR",
+    0x8: "XOR",
+    0x9: "SHL",
+    0xA: "SHR",
+    0xB: "CMP",
+    0xC: "JMP",
+    0xD: "B<cond>",
+    0xE: "IN/OUT",
+    0xF: "HLT",
 }
 
-NN_PORTS = {
-    0x50: "NN_A (Latch Activation)",
-    0x51: "NN_W (Trigger MAC: acc += A * W)",
-    0x52: "NN_CTRL (Bit0: Clr Acc, Bit1: Clr Cnt)",
-    0x53: "NN_ACC0 (Acc Bits [7:0])",
-    0x54: "NN_ACC1 (Acc Bits [15:8])",
-    0x55: "NN_ACC2 (Acc Bits [23:16])",
-    0x56: "NN_SHIFT (Requant Shift 0..15)",
-    0x57: "NN_QOUT (Saturated Requant Byte)",
-    0x58: "NN_LUT_SEL (LUT Bank 0..3)",
-    0x59: "NN_ACT (Activated Output)",
-    0x5A: "NN_LUT_IDX (Direct LUT Index)",
-    0x5B: "NN_LUT_VAL (Direct LUT Value)",
-    0x5C: "NN_SKIPCNT (Zero-Skip Counter)",
-    0x5D: "NN_MACCNT (Executed MAC Counter)",
-    0x5E: "NN_RSVD",
-    0x5F: "NN_KEY (Write 0xA5 to Unlock / Read Status)",
-}
+BCOND_NAMES = ["BEQ", "BNE", "BCS", "BCC", "BMI", "BPL", "BVS", "BVC"]
 
-LOCAL_PORTS = {
-    0x00: "SWITCHES",
-    0x01: "BUTTONS",
-    0x02: "LEDS",
-    0x10: "SEG_VALUE",
-    0x11: "SEG_ENABLE",
-    0x20: "UART_TX",
-    0x21: "UART_RX",
-    0x22: "UART_STATUS",
-    0x30: "TIMER_COUNT",
-    0x31: "TIMER_CTRL",
-    0x40: "SLOW_ECHO",
-}
 
-def decode_instruction(ir_hex: str):
-    word = int(ir_hex, 16)
-    opcode = (word >> 12) & 0xF
-    rd = (word >> 9) & 0x7
-    rs1 = (word >> 6) & 0x7
-    rs2 = (word >> 3) & 0x7
-    imm8 = word & 0xFF
-    addr9 = word & 0x1FF
-    io_dir = (word >> 8) & 0x1
-    port = word & 0xFF
+def decode_ir(ir_val: int) -> Dict[str, object]:
+    opcode = (ir_val >> 12) & 0xF
+    rd = (ir_val >> 9) & 0x7
+    rs1 = (ir_val >> 6) & 0x7
+    rs2 = (ir_val >> 3) & 0x7
+    imm8 = ir_val & 0xFF
+    addr9 = ir_val & 0x1FF
+    io_dir = (ir_val >> 8) & 0x1
+    port = ir_val & 0xFF
 
-    signed_imm8 = imm8 - 256 if imm8 >= 128 else imm8
+    mnem = OPCODE_MNEMONICS.get(opcode, "UNK")
+    if opcode == 0xD:
+        mnem = BCOND_NAMES[rd]
+    elif opcode == 0xE:
+        mnem = "OUT" if io_dir == 1 else "IN"
+    elif opcode == 0x7 and rs1 == rs2:
+        mnem = "MOV"
 
-    info = {
-        "opcode_hex": f"0x{opcode:X}",
-        "mnemonic": "UNKNOWN",
-        "operands": "",
-        "fsm_path": ["FETCH", "DECODE"],
-        "nominal_cycles": 2,
-        "wb_sel": "None",
-        "behind_the_scenes": "",
+    wb_sel = None
+    if opcode in (0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA):
+        wb_sel = "00 (ALU)"
+    elif opcode == 0x2:
+        wb_sel = "01 (MEM)"
+    elif opcode == 0x1:
+        wb_sel = "10 (IMM)"
+    elif opcode == 0xE and io_dir == 0:
+        wb_sel = "11 (IO)"
+
+    return {
+        "opcode": opcode,
+        "mnemonic": mnem,
+        "rd": rd,
+        "rs1": rs1,
+        "rs2": rs2,
+        "imm8": f"0x{imm8:02X}",
+        "addr9": f"0x{addr9:03X}",
+        "io_dir": io_dir,
+        "port": f"0x{port:02X}",
+        "wb_sel": wb_sel,
     }
 
-    if opcode == 0x0:
-        info.update({
-            "mnemonic": "NOP",
-            "fsm_path": ["FETCH", "DECODE"],
-            "nominal_cycles": 2,
-            "behind_the_scenes": "No architectural state change; PC advances and instruction retires in DECODE."
-        })
-    elif opcode == 0x1:
-        info.update({
-            "mnemonic": "LDI",
-            "operands": f"R{rd}, 0x{imm8:02X} ({imm8} / {signed_imm8})",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE", "WRITEBACK"],
-            "nominal_cycles": 4,
-            "wb_sel": "10 (Immediate)",
-            "behind_the_scenes": f"Extracts 8-bit immediate 0x{imm8:02X} from IR[7:0] and routes via wb_sel=10 into R{rd} on WRITEBACK edge."
-        })
-    elif opcode == 0x2:
-        info.update({
-            "mnemonic": "LD",
-            "operands": f"R{rd}, [R{rs1}]",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE", "MEM_IO", "WRITEBACK"],
-            "nominal_cycles": 5,
-            "wb_sel": "01 (Data Memory)",
-            "behind_the_scenes": f"Uses R{rs1} as byte address into 256B Data RAM; routes async read data via wb_sel=01 into R{rd}."
-        })
-    elif opcode == 0x3:
-        info.update({
-            "mnemonic": "ST",
-            "operands": f"[R{rs1}], R{rd}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE", "MEM_IO"],
-            "nominal_cycles": 4,
-            "behind_the_scenes": f"Uses R{rs1} as address pointer and writes byte in R{rd} synchronously into Data RAM during MEM_IO."
-        })
-    elif opcode in (0x4, 0x5, 0x6, 0x7, 0x8):
-        op_names = {0x4: "ADD", 0x5: "SUB", 0x6: "AND", 0x7: "OR", 0x8: "XOR"}
-        mn = op_names[opcode]
-        pseudo = f" (MOV R{rd}, R{rs1})" if (opcode == 0x7 and rs1 == rs2) else ""
-        info.update({
-            "mnemonic": mn + pseudo,
-            "operands": f"R{rd}, R{rs1}, R{rs2}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE", "WRITEBACK"],
-            "nominal_cycles": 4,
-            "wb_sel": "00 (ALU Result)",
-            "behind_the_scenes": f"ALU computes R{rs1} {mn} R{rs2}, updates flags register in EXECUTE, and writes ALU result to R{rd} in WRITEBACK."
-        })
-    elif opcode in (0x9, 0xA):
-        mn = "SHL" if opcode == 0x9 else "SHR"
-        info.update({
-            "mnemonic": mn,
-            "operands": f"R{rd}, R{rs1}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE", "WRITEBACK"],
-            "nominal_cycles": 4,
-            "wb_sel": "00 (ALU Result)",
-            "behind_the_scenes": f"Shifts R{rs1} by 1 bit ({mn}), shifts outgoing bit into Carry (C), updates Z/N, and writes R{rd}."
-        })
-    elif opcode == 0xB:
-        info.update({
-            "mnemonic": "CMP",
-            "operands": f"R{rs1}, R{rs2}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE"],
-            "nominal_cycles": 3,
-            "behind_the_scenes": f"ALU performs R{rs1} - R{rs2} (a + ~b + 1) to update Z, N, C (no-borrow), and V flags without writing any register."
-        })
-    elif opcode == 0xC:
-        info.update({
-            "mnemonic": "JMP",
-            "operands": f"0x{addr9:03X}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE"],
-            "nominal_cycles": 3,
-            "behind_the_scenes": f"Unconditionally loads 9-bit target address 0x{addr9:03X} into Program Counter during EXECUTE."
-        })
-    elif opcode == 0xD:
-        mn, rule = COND_MAP.get(rd, ("BR", "?"))
-        info.update({
-            "mnemonic": mn,
-            "operands": f"0x{addr9:03X}",
-            "fsm_path": ["FETCH", "DECODE", "EXECUTE"],
-            "nominal_cycles": 3,
-            "behind_the_scenes": f"Evaluates condition ({rule}) against registered ZNCV flags; loads PC <- 0x{addr9:03X} if true."
-        })
-    elif opcode == 0xE:
-        port_desc = NN_PORTS.get(port, LOCAL_PORTS.get(port, f"Port 0x{port:02X}"))
-        if io_dir == 0:
-            info.update({
-                "mnemonic": "IN",
-                "operands": f"R{rd}, 0x{port:02X}",
-                "fsm_path": ["FETCH", "DECODE", "EXECUTE", "MEM_IO (+stalls)", "WRITEBACK"],
-                "nominal_cycles": 5,
-                "wb_sel": "11 (I/O Read Latch)",
-                "behind_the_scenes": f"Asserts io_rd on port 0x{port:02X} ({port_desc}), stalls in MEM_IO until io_ready=1, latches byte, and writes R{rd}."
-            })
-        else:
-            info.update({
-                "mnemonic": "OUT",
-                "operands": f"0x{port:02X}, R{rd}",
-                "fsm_path": ["FETCH", "DECODE", "EXECUTE", "MEM_IO (+stalls)"],
-                "nominal_cycles": 4,
-                "behind_the_scenes": f"Asserts io_wr on port 0x{port:02X} ({port_desc}) with byte from R{rd}; completes when io_ready=1."
-            })
-    elif opcode == 0xF:
-        info.update({
-            "mnemonic": "HLT",
-            "fsm_path": ["FETCH", "DECODE", "HALTED_S"],
-            "nominal_cycles": 2,
-            "behind_the_scenes": "Retires instruction in DECODE and transitions FSM into sticky HALTED_S state (halted = 1)."
-        })
 
-    return info
-
-# -------------------------------------------------------------------------
-# Helper: Parse Retirement Trace into Cycle-by-Cycle Cumulative State
-# -------------------------------------------------------------------------
-def parse_trace_file(trace_path: Path):
-    if not trace_path.exists():
-        return []
-    
-    regs = [0] * 8
-    dmem = {}
+def parse_trace_file(trace_text: str) -> List[Dict[str, object]]:
     steps = []
-    cum_cycles = 0
+    for line in trace_text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        seq_str, pc_str, ir_str, rf_we_str, rd_addr_str, rf_data_str, mem_we_str, mem_addr_str, mem_data_str, flags_str = parts[:10]
+        try:
+            ir_int = int(ir_str, 16)
+            pc_int = int(pc_str, 16)
+        except ValueError:
+            ir_int = 0
+            pc_int = 0
 
-    with open(trace_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) != 10:
-                continue
-            
-            seq_s, pc_s, ir_s, rf_we_s, rd_s, rf_data_s, mem_we_s, mem_addr_s, mem_data_s, flags_s = parts
-            rf_we = int(rf_we_s)
-            rd_addr = int(rd_s, 16)
-            rf_data = int(rf_data_s, 16)
-            mem_we = int(mem_we_s)
-            mem_addr = int(mem_addr_s, 16)
-            mem_data = int(mem_data_s, 16)
-
-            decoded = decode_instruction(ir_s)
-            cum_cycles += decoded["nominal_cycles"]
-
-            if rf_we:
-                regs[rd_addr] = rf_data
-            if mem_we:
-                dmem[f"0x{mem_addr:02X}"] = mem_data
-
-            steps.append({
-                "seq": int(seq_s),
-                "pc": f"0x{pc_s.upper()}",
-                "ir": f"0x{ir_s.upper()}",
-                "rf_we": rf_we,
-                "rd_addr": rd_addr,
-                "rf_data": rf_data,
-                "mem_we": mem_we,
-                "mem_addr": mem_addr,
-                "mem_data": mem_data,
-                "flags": {
-                    "raw": flags_s,
-                    "Z": int(flags_s[0]),
-                    "N": int(flags_s[1]),
-                    "C": int(flags_s[2]),
-                    "V": int(flags_s[3]),
-                },
+        decoded = decode_ir(ir_int)
+        steps.append(
+            {
+                "seq": int(seq_str),
+                "pc": f"0x{pc_int:03X}",
+                "pc_int": pc_int,
+                "ir": f"0x{ir_int:04X}",
+                "rf_we": int(rf_we_str),
+                "rd_addr": int(rd_addr_str),
+                "rf_data": f"0x{int(rf_data_str, 16):02X}",
+                "mem_we": int(mem_we_str),
+                "mem_addr": f"0x{int(mem_addr_str, 16):02X}",
+                "mem_data": f"0x{int(mem_data_str, 16):02X}",
+                "flags": flags_str,
                 "decoded": decoded,
-                "est_cumulative_cycles": cum_cycles,
-                "registers_snapshot": list(regs),
-                "dmem_snapshot": dict(dmem),
-            })
+            }
+        )
     return steps
 
-# -------------------------------------------------------------------------
-# Helper: Lightweight VCD Parser for Curated DSD-8 Waveform
-# -------------------------------------------------------------------------
-def parse_vcd_file(vcd_path: Path):
-    if not vcd_path.exists():
-        return {"error": "VCD file not found. Run 'make waveform' first."}
 
-    id_to_sig = {}
-    scope_stack = []
-    signals_meta = []
-    changes = {}
-    timestamps = []
+def build_hardware_luts() -> Dict[str, List[int]]:
+    """Generate the 4 256-entry int8 LUT banks used by the DSD-8 NN Accelerator."""
+    import math
 
-    with open(vcd_path, "r") as f:
-        lines = f.readlines()
+    relu_bank = []
+    sigmoid_bank = []
+    tanh_bank = []
+    offset_bank = []
+
+    for idx in range(256):
+        signed_x = idx - 256 if idx >= 128 else idx
+        # Bank 0: ReLU
+        relu_bank.append(max(0, signed_x))
+        # Bank 1: Quantized Sigmoid (0..127)
+        sig = int(round(127.0 / (1.0 + math.exp(-signed_x / 16.0))))
+        sigmoid_bank.append(max(0, min(127, sig)))
+        # Bank 2: Quantized Tanh (-128..127 stored as unsigned byte)
+        t_val = int(round(127.0 * math.tanh(signed_x / 32.0)))
+        tanh_bank.append(t_val & 0xFF)
+        # Bank 3: Offset binary (x + 128)
+        offset_bank.append((signed_x + 128) & 0xFF)
+
+    return {
+        "0_ReLU": relu_bank,
+        "1_Sigmoid": sigmoid_bank,
+        "2_Tanh": tanh_bank,
+        "3_OffsetBinary": offset_bank,
+    }
+
+
+@app.get("/api/status")
+def get_status():
+    return {
+        "status": "ok",
+        "project_root": str(PROJECT_ROOT),
+        "weights_available": WEIGHTS_PATH.exists(),
+        "bench_available": BENCH_MD_PATH.exists(),
+        "vcd_available": VCD_PATH.exists(),
+        "python_executable": sys.executable,
+    }
+
+
+@app.post("/api/simulate")
+def simulate_asm(req: SimRequest):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        asm_file = tmp_path / "program.asm"
+        hex_file = tmp_path / "program.hex"
+        lst_file = tmp_path / "program.lst"
+        trace_file = tmp_path / "gold.trace"
+        state_file = tmp_path / "state.json"
+
+        asm_file.write_text(req.asm_code, encoding="utf-8")
+
+        # 1. Run Two-Pass Assembler (dsd8asm.py)
+        asm_cmd = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "dsd8asm.py"),
+            str(asm_file),
+            "-o",
+            str(hex_file),
+            "--listing",
+            str(lst_file),
+        ]
+        asm_proc = subprocess.run(
+            asm_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True
+        )
+        if asm_proc.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Assembler Error:\n{asm_proc.stderr or asm_proc.stdout}",
+            )
+
+        hex_text = hex_file.read_text(encoding="utf-8") if hex_file.exists() else ""
+        listing_text = lst_file.read_text(encoding="utf-8") if lst_file.exists() else ""
+
+        # 2. Run Golden Simulator (dsd8sim_nn.py or dsd8sim.py)
+        if req.use_nn_sim:
+            sim_cmd = [
+                sys.executable,
+                str(PROJECT_ROOT / "tools" / "dsd8sim_nn.py"),
+                str(hex_file),
+                "--trace",
+                str(trace_file),
+                "--state-out",
+                str(state_file),
+                "--max-instrs",
+                str(req.max_instrs),
+            ]
+        else:
+            sim_cmd = [
+                sys.executable,
+                str(PROJECT_ROOT / "tools" / "dsd8sim.py"),
+                str(hex_file),
+                "--trace",
+                str(trace_file),
+                "--state-out",
+                str(state_file),
+                "--switches",
+                req.switches,
+                "--buttons",
+                req.buttons,
+            ]
+
+        sim_proc = subprocess.run(
+            sim_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True
+        )
+        if sim_proc.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Simulator Error:\n{sim_proc.stderr or sim_proc.stdout}",
+            )
+
+        raw_trace = trace_file.read_text(encoding="utf-8") if trace_file.exists() else ""
+        steps = parse_trace_file(raw_trace)
+        state_data = (
+            json.loads(state_file.read_text(encoding="utf-8"))
+            if state_file.exists()
+            else {}
+        )
+
+        breakpoint_hit_idx = None
+        if req.breakpoint_pc is not None:
+            for idx, st in enumerate(steps):
+                if st.get("pc_int") == req.breakpoint_pc:
+                    breakpoint_hit_idx = idx
+                    break
+
+        return {
+            "hex": hex_text,
+            "listing": listing_text,
+            "raw_trace": raw_trace,
+            "trace": steps,
+            "state": state_data,
+            "total_steps": len(steps),
+            "breakpoint_hit_idx": breakpoint_hit_idx,
+        }
+
+
+@app.get("/api/nn/samples")
+def get_nn_samples():
+    weights_data = {}
+    if WEIGHTS_PATH.exists():
+        try:
+            weights_data = json.loads(WEIGHTS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            weights_data = {}
+
+    bench_md = ""
+    if BENCH_MD_PATH.exists():
+        bench_md = BENCH_MD_PATH.read_text(encoding="utf-8")
+
+    x_test = weights_data.get("X_test_q", [])
+    y_test = weights_data.get("y_test", [])
+    class_names = ["Iris-setosa", "Iris-versicolor", "Iris-virginica"]
+
+    samples = []
+    for idx in range(max(len(x_test), 23)):
+        feats = x_test[idx] if idx < len(x_test) else [0, 0, 0, 0]
+        label = y_test[idx] if idx < len(y_test) else 0
+        samples.append(
+            {
+                "index": idx,
+                "features": feats,
+                "label": label,
+                "class_name": class_names[label] if 0 <= label < 3 else f"Class {label}",
+            }
+        )
+
+    return {
+        "samples": samples,
+        "shift1": weights_data.get("shift1", 7),
+        "shift2": weights_data.get("shift2", 7),
+        "bench_md": bench_md,
+        "variants": ["b0", "b1", "a0", "a2", "a4"],
+    }
+
+
+@app.get("/api/nn/sample/{sample_idx}/{variant}")
+def get_nn_sample_asm(sample_idx: int, variant: str):
+    asm_file = TESTS_NN_DIR / f"s{sample_idx:02d}_{variant}.asm"
+    if not asm_file.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sample assembly {asm_file.name} not found. Run 'make nn' in Toolchain tab to generate.",
+        )
+    asm_code = asm_file.read_text(encoding="utf-8")
+    return {
+        "sample_idx": sample_idx,
+        "variant": variant,
+        "filename": asm_file.name,
+        "asm_code": asm_code,
+    }
+
+
+@app.get("/api/nn/lut")
+def get_nn_luts():
+    return {"luts": build_hardware_luts()}
+
+
+def to_signed8(val: int) -> int:
+    val = int(val) & 0xFF
+    return val - 256 if val >= 128 else val
+
+
+def sat8(val: int) -> int:
+    return max(-128, min(127, int(val)))
+
+
+def wrap24(val: int) -> int:
+    val = int(val) & 0xFFFFFF
+    return val - 0x1000000 if val & 0x800000 else val
+
+
+@app.post("/api/nn/custom-infer")
+def run_custom_nn_inference(req: CustomNNRequest):
+    if not WEIGHTS_PATH.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="nn/data/weights_q.json not found. Run 'python3 nn/nn_ref.py' first.",
+        )
+
+    weights = json.loads(WEIGHTS_PATH.read_text(encoding="utf-8"))
+    W1 = weights.get("W1_q", [])
+    b1 = weights.get("b1_q", [])
+    W2 = weights.get("W2_q", [])
+    b2 = weights.get("b2_q", [])
+    shift1 = req.shift1 if req.shift1 is not None else weights.get("shift1", 7)
+    shift2 = req.shift2 if req.shift2 is not None else weights.get("shift2", 7)
+
+    x_in = [sat8(v) for v in (req.features + [0, 0, 0, 0])[:4]]
+    luts = build_hardware_luts()
+    bank_keys = ["0_ReLU", "1_Sigmoid", "2_Tanh", "3_OffsetBinary"]
+    selected_lut = luts[bank_keys[max(0, min(3, req.lut_bank))]]
+
+    mac_count = 0
+    skip_count = 0
+
+    # Layer 1: 4 -> 6
+    layer1_acc = []
+    layer1_qout = []
+    layer1_act = []
+
+    for h in range(len(b1)):
+        acc = wrap24(b1[h])
+        for i in range(4):
+            a_val = x_in[i]
+            # Support both [6][4] and [4][6] weight layouts gracefully
+            w_val = W1[h][i] if len(W1) == len(b1) else W1[i][h]
+            if a_val == 0 or w_val == 0:
+                skip_count += 1
+            else:
+                mac_count += 1
+            acc = wrap24(acc + a_val * w_val)
+        layer1_acc.append(acc)
+        qout = sat8(acc >> shift1)
+        layer1_qout.append(qout)
+        lut_val = to_signed8(selected_lut[qout & 0xFF])
+        layer1_act.append(lut_val)
+
+    # Layer 2: 6 -> 3
+    layer2_acc = []
+    layer2_scores = []
+    for c in range(len(b2)):
+        acc = wrap24(b2[c])
+        for h in range(len(b1)):
+            a_val = layer1_act[h]
+            w_val = W2[c][h] if len(W2) == len(b2) else W2[h][c]
+            if a_val == 0 or w_val == 0:
+                skip_count += 1
+            else:
+                mac_count += 1
+            acc = wrap24(acc + a_val * w_val)
+        layer2_acc.append(acc)
+        qout = sat8(acc >> shift2)
+        layer2_scores.append(qout)
+
+    pred_class = int(max(range(len(layer2_scores)), key=lambda idx: layer2_scores[idx]))
+    class_names = ["Iris-setosa", "Iris-versicolor", "Iris-virginica"]
+
+    # Generate concise runnable DSD-8 Assembly snippet demonstrating Neuron 0 MAC + LUT
+    w1_n0 = [W1[0][i] if len(W1) == len(b1) else W1[i][0] for i in range(4)]
+    b1_n0 = b1[0] if b1 else 0
+    asm_lines = [
+        "; Custom Quantized Iris Neuron-0 Hardware Accelerator Test",
+        f"; Input Vector X = {x_in}, shift1 = {shift1}, LUT Bank = {req.lut_bank}",
+        "LDI R0, 0xA5",
+        "OUT 0x5F, R0       ; Unlock int8 NN Accelerator",
+        "LDI R0, 0x03",
+        "OUT 0x52, R0       ; Clear 24-bit accumulator & MAC/skip counters",
+        f"LDI R0, {shift1}",
+        "OUT 0x56, R0       ; Set NN_SHIFT (port 0x56)",
+        f"LDI R0, {req.lut_bank}",
+        "OUT 0x58, R0       ; Select NN_LUT_SEL bank (port 0x58)",
+        f"LDI R1, 1",
+        "OUT 0x50, R1       ; A = 1 (for bias load)",
+        f"LDI R2, {b1_n0 & 0xFF}",
+        "OUT 0x51, R2       ; Acc += 1 * bias",
+    ]
+    for idx in range(4):
+        asm_lines.extend(
+            [
+                f"LDI R1, {x_in[idx] & 0xFF}",
+                f"OUT 0x50, R1       ; Feature X[{idx}] = {x_in[idx]}",
+                f"LDI R2, {w1_n0[idx] & 0xFF}",
+                f"OUT 0x51, R2       ; Weight W1[0][{idx}] = {w1_n0[idx]}",
+            ]
+        )
+    asm_lines.extend(
+        [
+            "IN R3, 0x57        ; Read Requantized NN_QOUT (port 0x57)",
+            "IN R4, 0x59        ; Read HW LUT Activated NN_ACT (port 0x59)",
+            "IN R5, 0x5C        ; Read Zero-Skip Counter NN_SKIPCNT (port 0x5C)",
+            "IN R6, 0x5D        ; Read Executed MAC Counter NN_MACCNT (port 0x5D)",
+            "OUT 0x02, R4       ; Display Neuron-0 Activation on Board LEDs",
+            "HLT",
+        ]
+    )
+
+    return {
+        "features": x_in,
+        "shift1": shift1,
+        "shift2": shift2,
+        "lut_bank": req.lut_bank,
+        "layer1_acc": layer1_acc,
+        "layer1_qout": layer1_qout,
+        "layer1_act": layer1_act,
+        "layer2_acc": layer2_acc,
+        "layer2_scores": layer2_scores,
+        "predicted_class": pred_class,
+        "predicted_name": class_names[pred_class] if 0 <= pred_class < 3 else f"Class {pred_class}",
+        "mac_count": mac_count,
+        "skip_count": skip_count,
+        "total_ops": mac_count + skip_count,
+        "sparsity_pct": round((skip_count / max(1, mac_count + skip_count)) * 100, 1),
+        "generated_asm": "\n".join(asm_lines),
+    }
+
+
+def parse_vcd_file(vcd_path: Path, max_timestamps: int = 80) -> Dict[str, object]:
+    text = vcd_path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+
+    scope_stack: List[str] = []
+    id_to_sig: Dict[str, Dict[str, object]] = {}
+    timestamps: List[int] = []
+    current_values: Dict[str, str] = {}
+    history: Dict[str, List[str]] = {}
 
     in_defs = True
-    current_time = 0
-
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
-
         if in_defs:
             if line.startswith("$scope"):
                 parts = line.split()
@@ -308,87 +513,183 @@ def parse_vcd_file(vcd_path: Path):
                     scope_stack.pop()
             elif line.startswith("$var"):
                 parts = line.split()
-                # $var wire 8 ! leds [7:0] $end
-                width = int(parts[2])
-                sym = parts[3]
-                name = parts[4]
-                full_name = ".".join(scope_stack[-2:] + [name]) if len(scope_stack) >= 2 else name
-                if sym not in id_to_sig:
-                    id_to_sig[sym] = {"name": full_name, "width": width}
-                    signals_meta.append({"id": sym, "name": full_name, "width": width})
-                    changes[full_name] = []
+                if len(parts) >= 5:
+                    width = int(parts[2])
+                    sig_id = parts[3]
+                    sig_name = parts[4]
+                    group = scope_stack[-1].upper() if scope_stack else "SYS"
+                    if sig_id not in id_to_sig:
+                        id_to_sig[sig_id] = {
+                            "id": sig_id,
+                            "name": sig_name,
+                            "width": width,
+                            "group": group,
+                        }
+                        current_values[sig_id] = "0" if width == 1 else "0x00"
+                        history[sig_id] = []
             elif line.startswith("$enddefinitions"):
                 in_defs = False
         else:
             if line.startswith("#"):
-                current_time = int(line[1:])
-                timestamps.append(current_time)
-            elif line.startswith(("0", "1", "x", "z", "X", "Z")) and len(line) >= 2:
-                val = line[0]
-                sym = line[1:]
-                if sym in id_to_sig:
-                    sig_name = id_to_sig[sym]["name"]
-                    changes[sig_name].append({"t": current_time, "v": val})
+                if len(timestamps) >= max_timestamps:
+                    break
+                try:
+                    ts = int(line[1:])
+                except ValueError:
+                    continue
+                if timestamps:
+                    for sid in id_to_sig:
+                        history[sid].append(current_values.get(sid, "0"))
+                timestamps.append(ts)
+            elif line.startswith(("0", "1", "x", "z", "X", "Z")):
+                val = line[0].lower()
+                sid = line[1:].strip()
+                if sid in id_to_sig:
+                    current_values[sid] = "1" if val == "1" else "0"
             elif line.startswith(("b", "B")):
                 parts = line.split()
-                if len(parts) == 2:
-                    bin_str = parts[0][1:]
-                    sym = parts[1]
-                    if sym in id_to_sig:
-                        sig_name = id_to_sig[sym]["name"]
+                if len(parts) >= 2:
+                    bits = parts[0][1:]
+                    sid = parts[1]
+                    if sid in id_to_sig:
+                        width = int(id_to_sig[sid]["width"])
                         try:
-                            hex_val = f"0x{int(bin_str, 2):X}"
+                            ival = int(bits.replace("x", "0").replace("z", "0"), 2)
+                            hex_len = max(1, (width + 3) // 4)
+                            current_values[sid] = f"0x{ival:0{hex_len}X}"
                         except ValueError:
-                            hex_val = f"b{bin_str}"
-                        changes[sig_name].append({"t": current_time, "v": hex_val})
+                            current_values[sid] = "0x00"
+
+    if timestamps:
+        for sid in id_to_sig:
+            if len(history[sid]) < len(timestamps):
+                history[sid].append(current_values.get(sid, "0"))
+
+    signals_out = []
+    for sid, meta in id_to_sig.items():
+        signals_out.append(
+            {
+                "id": sid,
+                "name": meta["name"],
+                "width": meta["width"],
+                "group": meta["group"],
+                "values": history.get(sid, []),
+            }
+        )
 
     return {
-        "max_time": timestamps[-1] if timestamps else 0,
-        "signals": signals_meta,
-        "changes": changes,
+        "source": str(vcd_path.name),
+        "timestamps": timestamps,
+        "signals": signals_out,
     }
 
-# -------------------------------------------------------------------------
-# API Endpoints: Local File Browser & Editor
-# -------------------------------------------------------------------------
-@app.get("/api/files")
-def list_project_files():
-    target_dirs = ["rtl", "tb", "sim", "tools", "nn", "tests", "scripts"]
-    file_list = []
-    for root_file in ["Makefile", "README.md", "STUDENT_GUIDE.md", "CHANGELOG.md"]:
-        if (PROJECT_ROOT / root_file).exists():
-            file_list.append(root_file)
 
-    for d in target_dirs:
-        dir_path = PROJECT_ROOT / d
-        if dir_path.exists():
-            for path in sorted(dir_path.rglob("*")):
-                if path.is_file() and path.suffix in [".v", ".py", ".asm", ".hex", ".json", ".md", ".sh"]:
-                    file_list.append(str(path.relative_to(PROJECT_ROOT)))
-    return {"files": file_list}
+@app.get("/api/waveform")
+def get_waveform(generate: bool = False):
+    if generate or not VCD_PATH.exists():
+        try:
+            subprocess.run(
+                ["make", "waveform"],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
 
-@app.get("/api/file")
-def read_project_file(path: str = Query(...)):
-    full_path = (PROJECT_ROOT / path).resolve()
-    if not str(full_path).startswith(str(PROJECT_ROOT)) or not full_path.exists():
-        raise HTTPException(status_code=404, detail="File not found or access denied")
-    return {"path": path, "content": full_path.read_text(encoding="utf-8", errors="replace")}
+    if VCD_PATH.exists():
+        return parse_vcd_file(VCD_PATH)
 
-@app.post("/api/file")
-def save_project_file(payload: FileUpdate):
-    full_path = (PROJECT_ROOT / payload.path).resolve()
-    if not str(full_path).startswith(str(PROJECT_ROOT)):
-        raise HTTPException(status_code=403, detail="Invalid path")
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(payload.content, encoding="utf-8")
-    return {"status": "saved", "path": payload.path}
+    return {
+        "source": "trace_synthesized",
+        "timestamps": [],
+        "signals": [],
+    }
 
-# -------------------------------------------------------------------------
-# API Endpoints: Live SSE Command Runner
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# API Endpoints: Live SSE Command Runner
-# -------------------------------------------------------------------------
+
+TEST_SUITE_TARGETS = {
+    "tb_alu": {
+        "name": "ALU Unit Testbench (tb_alu.v)",
+        "Compile": ["iverilog", "-g2012", "-o", "build/tb_alu.vvp", "rtl/alu.v", "tb/tb_alu.v"],
+        "Run": ["vvp", "build/tb_alu.vvp"],
+    },
+    "tb_nn": {
+        "name": "NN Accelerator Unit Testbench (tb_nn_accel.v)",
+        "Compile": [
+            "iverilog",
+            "-g2012",
+            "-o",
+            "build/tb_nn_accel.vvp",
+            "rtl/nn_accel.v",
+            "tb/tb_nn_accel.v",
+        ],
+        "Run": ["vvp", "build/tb_nn_accel.vvp"],
+    },
+    "tb_cpu": {
+        "name": "Full CPU + Peripherals Testbench (make test)",
+        "Run": ["make", "test"],
+    },
+    "conformance": {
+        "name": "Golden Assembler & Simulator Conformance (make conformance)",
+        "Run": ["make", "conformance"],
+    },
+    "lint": {
+        "name": "Verilator Strict RTL Lint (make lint)",
+        "Run": ["make", "lint"],
+    },
+}
+
+
+@app.post("/api/test-suite/{target_key}")
+def run_test_suite_target(target_key: str):
+    if target_key not in TEST_SUITE_TARGETS:
+        raise HTTPException(status_code=404, detail=f"Unknown test target: {target_key}")
+
+    os.makedirs(PROJECT_ROOT / "build", exist_ok=True)
+    target = TEST_SUITE_TARGETS[target_key]
+    start_t = time.time()
+    logs = []
+    passed = True
+
+    if "Compile" in target:
+        c_proc = subprocess.run(
+            target["Compile"], cwd=str(PROJECT_ROOT), capture_output=True, text=True
+        )
+        if c_proc.stdout:
+            logs.append(c_proc.stdout)
+        if c_proc.stderr:
+            logs.append(c_proc.stderr)
+        if c_proc.returncode != 0:
+            passed = False
+
+    if passed and "Run" in target:
+        r_proc = subprocess.run(
+            target["Run"], cwd=str(PROJECT_ROOT), capture_output=True, text=True
+        )
+        if r_proc.stdout:
+            logs.append(r_proc.stdout)
+        if r_proc.stderr:
+            logs.append(r_proc.stderr)
+        if r_proc.returncode != 0 or "FAIL" in (r_proc.stdout + r_proc.stderr):
+            passed = False
+
+    duration_ms = int((time.time() - start_t) * 1000)
+    full_log = "\n".join(logs).strip()
+    pass_matches = len(re.findall(r"PASS", full_log, re.IGNORECASE))
+    fail_matches = len(re.findall(r"FAIL", full_log, re.IGNORECASE))
+
+    return {
+        "target": target_key,
+        "name": target["name"],
+        "passed": passed and fail_matches == 0,
+        "pass_count": max(1 if passed else 0, pass_matches),
+        "fail_count": fail_matches,
+        "duration_ms": duration_ms,
+        "log": full_log or "Completed with exit code 0.",
+    }
+
+
 ALLOWED_COMMANDS = {
     "lint": ["make", "lint"],
     "test": ["make", "test"],
@@ -396,184 +697,51 @@ ALLOWED_COMMANDS = {
     "all": ["make", "all"],
     "waveform": ["make", "waveform"],
     "nn_ref": [sys.executable, "nn/nn_ref.py"],
-    "nn_gen": ["make", "nn"],
-    "bench_quick": [sys.executable, "scripts/run_nn.py", "--samples", "0", "--posted", "1"],
-    "bench_full": ["make", "bench"],
+    "nn_build": ["make", "nn"],
+    "nn_run": [sys.executable, "scripts/run_nn.py"],
+    "bench": ["make", "bench"],
 }
 
-@app.get("/api/stream/{cmd_key}")
-def stream_command(cmd_key: str):
+
+@app.get("/api/cmd/{cmd_key}")
+async def stream_command(cmd_key: str):
     if cmd_key not in ALLOWED_COMMANDS:
-        raise HTTPException(status_code=400, detail="Unknown command key")
+        raise HTTPException(status_code=400, detail=f"Invalid command key: {cmd_key}")
 
     cmd = ALLOWED_COMMANDS[cmd_key]
 
-    def event_generator():
+    async def event_generator():
         yield f"data: $ {' '.join(cmd)}\n\n"
         try:
-            proc = subprocess.Popen(
-                cmd,
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
                 cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
-            for line in iter(proc.stdout.readline, ""):
-                clean = line.rstrip("\r\n")
-                yield f"data: {clean}\n\n"
-            proc.stdout.close()
-            rc = proc.wait()
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                decoded_line = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                yield f"data: {decoded_line}\n\n"
+            rc = await proc.wait()
             yield f"data: [Process exited with code {rc}]\n\n"
         except Exception as exc:
-            yield f"data: [ERROR] {str(exc)}\n\n"
+            yield f"data: [Error executing command: {exc}]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-# -------------------------------------------------------------------------
-# API Endpoints: Assemble & Simulate Custom or Existing Assembly
-# -------------------------------------------------------------------------
-@app.post("/api/simulate")
-def assemble_and_simulate(req: CustomAssembleRequest):
-    try:
-        work_dir = PROJECT_ROOT / "build" / "studio_sim"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        asm_file = work_dir / "studio_prog.asm"
-        hex_file = work_dir / "studio_prog.hex"
-        lst_file = work_dir / "studio_prog.lst"
-        gold_trace = work_dir / "gold.trace"
-        state_json = work_dir / "state.json"
-        asm_file.write_text(req.asm_code, encoding="utf-8")
-        asm_cmd = [sys.executable, "tools/dsd8asm.py", str(asm_file), "-o", str(hex_file), "--listing", str(lst_file)]
-        asm_res = subprocess.run(asm_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
-        if asm_res.returncode != 0:
-            return {"status": "error", "stage": "assembler", "log": asm_res.stderr or asm_res.stdout}
-        if req.use_nn_sim:
-            sim_cmd = [sys.executable, "tools/dsd8sim_nn.py", str(hex_file), "--trace", str(gold_trace), "--state-out", str(state_json)]
-        else:
-            sim_cmd = [sys.executable, "tools/dsd8sim.py", str(hex_file), "--trace", str(gold_trace), "--state-out", str(state_json), "--switches", req.switches, "--buttons", req.buttons]
-        sim_res = subprocess.run(sim_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
-        if sim_res.returncode != 0:
-            return {"status": "error", "stage": "golden_sim", "log": sim_res.stderr or sim_res.stdout}
-        steps = parse_trace_file(gold_trace)
-        final_state = json.loads(state_json.read_text()) if state_json.exists() else {}
-        listing_text = lst_file.read_text() if lst_file.exists() else ""
-        return {"status": "ok", "listing": listing_text, "final_state": final_state, "total_retired": len(steps), "trace_steps": steps, "log": sim_res.stdout}
-    except Exception as e:
-        return {"status": "error", "stage": "backend_exception", "log": str(e)}
 
-# -------------------------------------------------------------------------
-# API Endpoints: Waveform VCD & NN Benchmark Comparison Data
-# -------------------------------------------------------------------------
-@app.get("/api/waveform")
-def get_waveform_data():
-    vcd_path = PROJECT_ROOT / "build" / "waveform" / "dsd8_wave.vcd"
-    if not vcd_path.exists():
-        subprocess.run(["make", "waveform"], cwd=str(PROJECT_ROOT), capture_output=True)
-    return parse_vcd_file(vcd_path)
-
-@app.get("/api/nn/comparison")
-def get_nn_comparison(sample_idx: int = 0):
-    weights_path = PROJECT_ROOT / "nn" / "data" / "weights_q.json"
-    weights_info = {}
-    if weights_path.exists():
-        raw = json.loads(weights_path.read_text())
-        weights_info = {
-            "shift1": raw.get("shift1"),
-            "shift2": raw.get("shift2"),
-            "num_test_samples": len(raw.get("X_test_q", [])),
-            "sample_x": raw.get("X_test_q", [[0,0,0,0]])[sample_idx] if raw.get("X_test_q") else [],
-            "sample_y_true": raw.get("y_test", [0])[sample_idx] if raw.get("y_test") else 0,
-        }
-
-    bench_md_path = PROJECT_ROOT / "build" / "nn" / "bench.md"
-    bench_md_text = bench_md_path.read_text() if bench_md_path.exists() else None
-
-    variants = [
-        {
-            "id": "b0",
-            "name": "b0: Repeated Addition (Software)",
-            "uses_nn_accel": False,
-            "activation": "Software ReLU",
-            "mean_cycles": 43155,
-            "min_cycles": 41637,
-            "max_cycles": 44678,
-            "speedup_vs_b0": 1.0,
-            "speedup_vs_b1": 0.6,
-            "max_instr": 388,
-            "asm_file": f"tests/nn/s{sample_idx:02d}_b0.asm"
-        },
-        {
-            "id": "b1",
-            "name": "b1: Shift-and-Add (Software)",
-            "uses_nn_accel": False,
-            "activation": "Software ReLU",
-            "mean_cycles": 24427,
-            "min_cycles": 24135,
-            "max_cycles": 24654,
-            "speedup_vs_b0": 1.8,
-            "speedup_vs_b1": 1.0,
-            "max_instr": 434,
-            "asm_file": f"tests/nn/s{sample_idx:02d}_b1.asm"
-        },
-        {
-            "id": "a0",
-            "name": "a0: Looped Accel + SW Activation",
-            "uses_nn_accel": True,
-            "activation": "Software via NN_QOUT (0x57)",
-            "mean_cycles": 2172,
-            "min_cycles": 2171,
-            "max_cycles": 2175,
-            "speedup_vs_b0": 19.9,
-            "speedup_vs_b1": 11.2,
-            "max_instr": 260,
-            "asm_file": f"tests/nn/s{sample_idx:02d}_a0.asm"
-        },
-        {
-            "id": "a2",
-            "name": "a2: Looped Accel + Hardware LUT",
-            "uses_nn_accel": True,
-            "activation": "Hardware LUT via NN_ACT (0x59)",
-            "mean_cycles": 2071,
-            "min_cycles": 2071,
-            "max_cycles": 2071,
-            "speedup_vs_b0": 20.8,
-            "speedup_vs_b1": 11.8,
-            "max_instr": 250,
-            "asm_file": f"tests/nn/s{sample_idx:02d}_a2.asm"
-        },
-        {
-            "id": "a4",
-            "name": "a4: Fully Unrolled Accel + HW LUT",
-            "uses_nn_accel": True,
-            "activation": "Hardware LUT via NN_ACT (0x59)",
-            "mean_cycles": 1087,
-            "min_cycles": 1087,
-            "max_cycles": 1087,
-            "speedup_vs_b0": 39.7,
-            "speedup_vs_b1": 22.5,
-            "max_instr": 303,
-            "asm_file": f"tests/nn/s{sample_idx:02d}_a4.asm"
-        },
-    ]
-
-    return {
-        "accuracy_summary": "22 / 23 (95.65%)",
-        "configurations_verified": "230 / 230 (23 samples x 5 variants x 2 posted modes)",
-        "sample_info": weights_info,
-        "variants": variants,
-        "bench_markdown": bench_md_text,
-    }
-
-# -------------------------------------------------------------------------
-# Serve Compiled React Frontend in Production (Docker / Render)
-# -------------------------------------------------------------------------
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-
+# Static SPA Serving for Production (Docker / Render.com)
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 if FRONTEND_DIST.exists():
-    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND_DIST / "assets")),
+        name="assets",
+    )
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
