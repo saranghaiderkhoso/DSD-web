@@ -27,6 +27,23 @@ import {
 
 const API_BASE = "";
 
+async function safeFetchJson(url: string, init?: RequestInit) {
+  const res = await fetch(url, init);
+  const rawText = await res.text();
+  let data: any = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    throw new Error(
+      `Server returned non-JSON response (HTTP ${res.status}): ${rawText.slice(0, 200)}`
+    );
+  }
+  if (!res.ok) {
+    throw new Error(data?.detail || `HTTP ${res.status}: ${rawText.slice(0, 200)}`);
+  }
+  return data;
+}
+
 const DEFAULT_ASM = `; DSD-8 + int8 Neural Network Accelerator Demo
 LDI R0, 0xA5
 OUT 0x5F, R0 ; Unlock NN Accelerator (Port 0x5F = 0xA5)
@@ -193,7 +210,6 @@ export default function App() {
     "cpu" | "datapath" | "waveform" | "nn" | "wizard" | "verify" | "toolchain"
   >("cpu");
 
-  // Simulator State
   const [asmCode, setAsmCode] = useState<string>(DEFAULT_ASM);
   const [useNnSim, setUseNnSim] = useState<boolean>(true);
   const [switchesVal, setSwitchesVal] = useState<number>(0);
@@ -209,13 +225,11 @@ export default function App() {
   const [simError, setSimError] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
-  // Advanced Debugging: Breakpoints & Watchpoints
   const [breakpoints, setBreakpoints] = useState<number[]>([]);
   const [bpInput, setBpInput] = useState<string>("0x006");
   const [watchReg, setWatchReg] = useState<number | null>(null);
   const [debugNotice, setDebugNotice] = useState<string | null>(null);
 
-  // NN Studio & Wizard State
   const [nnSamples, setNnSamples] = useState<NNSample[]>([]);
   const [selectedSample, setSelectedSample] = useState<number>(0);
   const [selectedVariant, setSelectedVariant] = useState<string>("a4");
@@ -227,25 +241,21 @@ export default function App() {
   const [customNnResult, setCustomNnResult] = useState<CustomNNResult | null>(null);
   const [lutsData, setLutsData] = useState<Record<string, number[]>>({});
 
-  // Waveform Viewer State
   const [waveTimestamps, setWaveTimestamps] = useState<number[]>([]);
   const [waveSignals, setWaveSignals] = useState<WaveformSignal[]>([]);
   const [waveSource, setWaveSource] = useState<string>("trace_synthesized");
   const [waveGroupFilter, setWaveGroupFilter] = useState<string>("ALL");
   const [waveZoom, setWaveZoom] = useState<number>(38);
 
-  // Verification Suite State
   const [testResults, setTestResults] = useState<Record<string, TestTargetResult>>({});
   const [runningTestKey, setRunningTestKey] = useState<string | null>(null);
 
-  // Toolchain Console State
   const [consoleLines, setConsoleLines] = useState<string[]>([
     "DSD-8 Studio Ready. Select a verification or build command above.",
   ]);
   const [isRunningCmd, setIsRunningCmd] = useState<boolean>(false);
   const consoleEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Reconstruct Architectural State at current stepIdx
   const reconstructed = useMemo(() => {
     const regs = [0, 0, 0, 0, 0, 0, 0, 0];
     const dmem = new Array(256).fill(0);
@@ -277,10 +287,9 @@ export default function App() {
       }
       flags = s.flags || flags;
 
-      // Track I/O OUT instructions (opcode 0xE, io_dir == 1)
       if (s.decoded.opcode === 0xe && s.decoded.io_dir === 1) {
         const portNum = parseInt(s.decoded.port, 16);
-        const srcVal = regs[s.decoded.rs1] ?? 0;
+        const srcVal = regs[s.decoded.rd] ?? 0;
         const signedSrc = srcVal >= 128 ? srcVal - 256 : srcVal;
         if (portNum === 0x02) leds = srcVal;
         if (portNum === 0x10) segVal = srcVal;
@@ -313,16 +322,17 @@ export default function App() {
     const qoutRaw = nnAcc >> nnShift;
     const nnQout = Math.max(-128, Math.min(127, qoutRaw));
     const nnAct = nnLutSel === 0 ? Math.max(0, nnQout) : nnQout;
+    const atEnd = trace.length > 0 && stepIdx >= trace.length - 1;
 
     return {
       regs,
       dmem,
       flags,
-      leds: finalState.leds ?? leds,
-      segVal: finalState.seg_value ?? segVal,
-      segEn: finalState.seg_enable ?? segEn,
+      leds: atEnd && finalState.leds !== undefined ? finalState.leds : leds,
+      segVal: atEnd && finalState.seg_value !== undefined ? finalState.seg_value : segVal,
+      segEn: atEnd && finalState.seg_enable !== undefined ? finalState.seg_enable : segEn,
       nn: {
-        unlocked: finalState.nn?.unlocked ?? nnUnlocked,
+        unlocked: nnUnlocked || Boolean(atEnd && finalState.nn?.unlocked),
         a: nnA,
         w: nnW,
         acc: nnAcc,
@@ -338,7 +348,6 @@ export default function App() {
 
   const currentStep: TraceStep | null = trace[stepIdx] ?? null;
 
-  // Auto-stepping interval with Breakpoint & Watchpoint detection
   useEffect(() => {
     if (!isPlaying) return;
     const timer = setInterval(() => {
@@ -388,7 +397,7 @@ export default function App() {
     setDebugNotice(null);
     setIsPlaying(false);
     try {
-      const res = await fetch(`${API_BASE}/api/simulate`, {
+      const data = await safeFetchJson(`${API_BASE}/api/simulate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -398,19 +407,14 @@ export default function App() {
           buttons: `0x${buttonsVal.toString(16).padStart(2, "0")}`,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setSimError(data.detail || "Simulation failed.");
-        return;
-      }
       setTrace(data.trace || []);
       setRawTrace(data.raw_trace || "");
       setHexCode(data.hex || "");
       setListing(data.listing || "");
       setFinalState(data.state || {});
       setStepIdx(0);
-    } catch (err) {
-      setSimError(`Backend connection error: ${String(err)}`);
+    } catch (err: any) {
+      setSimError(err?.message || String(err));
     } finally {
       setIsSimulating(false);
     }
@@ -418,23 +422,19 @@ export default function App() {
 
   async function fetchNnSamples() {
     try {
-      const res = await fetch(`${API_BASE}/api/nn/samples`);
-      if (!res.ok) return;
-      const data = await res.json();
+      const data = await safeFetchJson(`${API_BASE}/api/nn/samples`);
       setNnSamples(data.samples || []);
       setBenchMd(data.bench_md || "");
       if (data.shift1 !== undefined) setCustomShift1(data.shift1);
       if (data.shift2 !== undefined) setCustomShift2(data.shift2);
     } catch {
-      // Ignore initial fetch errors
+      // Ignore background fetch errors
     }
   }
 
   async function fetchNnLuts() {
     try {
-      const res = await fetch(`${API_BASE}/api/nn/lut`);
-      if (!res.ok) return;
-      const data = await res.json();
+      const data = await safeFetchJson(`${API_BASE}/api/nn/lut`);
       setLutsData(data.luts || {});
     } catch {
       // Ignore
@@ -443,24 +443,21 @@ export default function App() {
 
   async function loadSampleVariantAsm(sampleIdx: number, variant: string) {
     try {
-      const res = await fetch(`${API_BASE}/api/nn/sample/${sampleIdx}/${variant}`);
-      const data = await res.json();
-      if (!res.ok) {
-        setSimError(data.detail || "Could not load sample assembly.");
-        return;
-      }
+      setSimError(null);
+      const data = await safeFetchJson(`${API_BASE}/api/nn/sample/${sampleIdx}/${variant}`);
       setAsmCode(data.asm_code);
       setUseNnSim(true);
       setActiveTab("cpu");
       await runSimulation(data.asm_code, true);
-    } catch (err) {
-      setSimError(`Error loading sample assembly: ${String(err)}`);
+    } catch (err: any) {
+      setSimError(err?.message || String(err));
     }
   }
 
   async function runCustomWizardInference() {
     try {
-      const res = await fetch(`${API_BASE}/api/nn/custom-infer`, {
+      setSimError(null);
+      const data = await safeFetchJson(`${API_BASE}/api/nn/custom-infer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -470,24 +467,17 @@ export default function App() {
           lut_bank: customLutBank,
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        setCustomNnResult(data);
-      } else {
-        setSimError(data.detail || "Custom NN inference failed.");
-      }
-    } catch (err) {
-      setSimError(`Custom NN inference error: ${String(err)}`);
+      setCustomNnResult(data);
+    } catch (err: any) {
+      setSimError(`Custom NN inference error: ${err?.message || String(err)}`);
     }
   }
 
   async function loadVcdWaveform(generateNew: boolean) {
     try {
-      const res = await fetch(
+      const data = await safeFetchJson(
         `${API_BASE}/api/waveform?generate=${generateNew ? "true" : "false"}`
       );
-      if (!res.ok) return;
-      const data = await res.json();
       if (data.signals && data.signals.length > 0) {
         setWaveTimestamps(data.timestamps || []);
         setWaveSignals(data.signals || []);
@@ -498,7 +488,6 @@ export default function App() {
     }
   }
 
-  // Synthesize cycle-accurate digital waveforms from active trace when VCD not loaded
   const effectiveWaveform = useMemo(() => {
     if (waveSignals.length > 0 && waveTimestamps.length > 0) {
       return {
@@ -538,13 +527,12 @@ export default function App() {
   async function runSingleTestTarget(targetKey: string) {
     setRunningTestKey(targetKey);
     try {
-      const res = await fetch(`${API_BASE}/api/test-suite/${targetKey}`, {
+      const data = await safeFetchJson(`${API_BASE}/api/test-suite/${targetKey}`, {
         method: "POST",
       });
-      const data = await res.json();
-      if (res.ok) {
-        setTestResults((prev) => ({ ...prev, [targetKey]: data }));
-      }
+      setTestResults((prev) => ({ ...prev, [targetKey]: data }));
+    } catch (err: any) {
+      setSimError(err?.message || String(err));
     } finally {
       setRunningTestKey(null);
     }
@@ -650,7 +638,6 @@ export default function App() {
     win.document.close();
   }
 
-  // Active Datapath signals for Feature 2 SVG Schematic
   const dpActive = useMemo(() => {
     const op = currentStep?.decoded.opcode ?? -1;
     const isAlu = [0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb].includes(op);
@@ -665,7 +652,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col font-sans">
-      {/* Top Header & Feature 6 Artifact Export Bar */}
       <header className="border-b border-slate-800/80 bg-[#0F1624]/95 backdrop-blur px-6 py-3 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-blue-600/20 border border-blue-500/40 flex items-center justify-center text-blue-400 shadow-lg shadow-blue-600/10">
@@ -684,7 +670,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Navigation Tabs */}
         <nav className="flex flex-wrap items-center gap-1 bg-[#090D16] p-1 rounded-xl border border-slate-800">
           {[
             { id: "cpu", label: "CPU Debugger", icon: Code2 },
@@ -722,7 +707,6 @@ export default function App() {
           })}
         </nav>
 
-        {/* Feature 6: One-Click Artifact & PDF Report Export Engine */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => downloadArtifact("program.asm", asmCode)}
@@ -765,7 +749,6 @@ export default function App() {
         </div>
       </header>
 
-      {/* Error or Breakpoint Banner */}
       {simError && (
         <div className="mx-6 mt-4 p-3 rounded-xl bg-red-950/60 border border-red-500/50 text-red-200 text-xs flex items-center justify-between">
           <div className="flex items-center gap-2 font-mono whitespace-pre-wrap">
@@ -793,12 +776,9 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content Area */}
       <main className="flex-1 p-6 max-w-[1600px] w-full mx-auto">
-        {/* TAB 1: CPU DEBUGGER & INTERACTIVE PERIPHERALS */}
         {activeTab === "cpu" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Left Column: Assembly Editor + Execution Controls + Breakpoints */}
             <div className="lg:col-span-5 flex flex-col gap-5">
               <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col gap-3 shadow-xl">
                 <div className="flex items-center justify-between">
@@ -825,7 +805,6 @@ export default function App() {
                   className="w-full bg-[#090D16] border border-slate-800 rounded-xl p-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-blue-500 resize-y"
                 />
 
-                {/* Execution & Stepping Controls */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                   <button
                     onClick={() => runSimulation(asmCode, useNnSim)}
@@ -867,7 +846,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setIsPlaying(false);
-                        setStepIdx((s) => Math.min( Math.max(0, trace.length - 1), s + 1));
+                        setStepIdx((s) => Math.min(Math.max(0, trace.length - 1), s + 1));
                       }}
                       title="Step Forward (+1)"
                       className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300"
@@ -884,7 +863,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Clock Speed & Step Scrubber */}
                 <div className="flex items-center justify-between gap-4 text-xs text-slate-400 pt-1">
                   <span>
                     Step:{" "}
@@ -917,7 +895,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Feature 1: Breakpoints & Register Watchpoint Bar */}
                 <div className="border-t border-slate-800/80 pt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-1.5">
                     <span className="text-slate-400">PC Breakpoint:</span>
@@ -971,7 +948,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Feature 1: Interactive FPGA Board Peripherals Panel */}
               <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col gap-3 shadow-xl">
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-white flex items-center gap-2">
@@ -986,7 +962,6 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* Virtual LEDs (Port 0x02) */}
                 <div>
                   <div className="text-xs text-slate-400 mb-1.5 flex justify-between">
                     <span>Board LEDs (Port 0x02)</span>
@@ -1013,7 +988,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Interactive Slide Switches (Port 0x00) */}
                 <div>
                   <div className="text-xs text-slate-400 mb-1.5 flex justify-between">
                     <span>Slide Switches (Port 0x00 — Click to toggle)</span>
@@ -1041,7 +1015,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Push Buttons (Port 0x01) */}
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs text-slate-400">Push Buttons (Port 0x01):</span>
                   <div className="flex gap-1.5">
@@ -1066,9 +1039,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right Column: Register File, Flags, NN Telemetry, Instruction Trace & Data Memory */}
             <div className="lg:col-span-7 flex flex-col gap-5">
-              {/* Current Decoded Instruction & Flags Bar */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="md:col-span-2 bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex items-center justify-between">
                   <div>
@@ -1093,7 +1064,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* ZNCV Architectural Flags */}
                 <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
                   <span className="text-[11px] uppercase tracking-wider text-slate-400">
                     ALU Flags (Z N C V)
@@ -1118,7 +1088,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 8x8 Register File & int8 NN Accelerator State */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">
@@ -1151,7 +1120,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* int8 Neural Accelerator Coprocessor (0x50-0x5F) */}
                 <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -1204,7 +1172,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Interactive Instruction Execution Trace Table (Click row to jump, Click gutter to toggle breakpoint) */}
               <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-4">
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -1282,7 +1249,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: FEATURE 2 — INTERACTIVE GRAPHICAL DATAPATH SCHEMATIC */}
         {activeTab === "datapath" && (
           <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -1315,38 +1281,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Interactive SVG Block Diagram */}
             <div className="w-full overflow-x-auto bg-[#090D16] border border-slate-800 rounded-2xl p-4">
               <svg viewBox="0 0 1100 500" className="w-full h-auto min-w-[900px]">
-                {/* Bus Connectors */}
-                {/* PC -> IMEM */}
-                <line
-                  x1="150"
-                  y1="140"
-                  x2="220"
-                  y2="140"
-                  stroke="#2563EB"
-                  strokeWidth="4"
-                />
-                {/* IMEM -> Decoder */}
-                <line
-                  x1="390"
-                  y1="140"
-                  x2="460"
-                  y2="140"
-                  stroke="#2563EB"
-                  strokeWidth="4"
-                />
-                {/* Decoder -> RegFile */}
-                <line
-                  x1="620"
-                  y1="140"
-                  x2="690"
-                  y2="140"
-                  stroke="#2563EB"
-                  strokeWidth="3"
-                />
-                {/* RegFile -> ALU */}
+                <line x1="150" y1="140" x2="220" y2="140" stroke="#2563EB" strokeWidth="4" />
+                <line x1="390" y1="140" x2="460" y2="140" stroke="#2563EB" strokeWidth="4" />
+                <line x1="620" y1="140" x2="690" y2="140" stroke="#2563EB" strokeWidth="3" />
                 <line
                   x1="850"
                   y1="140"
@@ -1355,7 +1294,6 @@ export default function App() {
                   stroke={dpActive.isAlu ? "#2563EB" : "#334155"}
                   strokeWidth={dpActive.isAlu ? "5" : "2.5"}
                 />
-                {/* RegFile -> DMEM */}
                 <line
                   x1="770"
                   y1="220"
@@ -1364,7 +1302,6 @@ export default function App() {
                   stroke={dpActive.isMem ? "#10B981" : "#334155"}
                   strokeWidth={dpActive.isMem ? "5" : "2.5"}
                 />
-                {/* Decoder/IO -> NN Accelerator */}
                 <line
                   x1="540"
                   y1="220"
@@ -1373,7 +1310,6 @@ export default function App() {
                   stroke={dpActive.isNn ? "#F59E0B" : "#334155"}
                   strokeWidth={dpActive.isNn ? "5" : "2.5"}
                 />
-                {/* Writeback Bus */}
                 <path
                   d="M 980 220 L 980 450 L 730 450 L 730 220"
                   fill="none"
@@ -1382,7 +1318,6 @@ export default function App() {
                   strokeDasharray={currentStep?.rf_we ? "none" : "6,6"}
                 />
 
-                {/* BLOCK 1: 9-Bit Program Counter (PC) */}
                 <rect
                   x="30"
                   y="80"
@@ -1411,7 +1346,6 @@ export default function App() {
                   {dpActive.isBranch ? "BRANCH/JMP" : "PC + 1"}
                 </text>
 
-                {/* BLOCK 2: 512x16 Instruction Memory */}
                 <rect
                   x="220"
                   y="70"
@@ -1422,7 +1356,14 @@ export default function App() {
                   stroke="#2563EB"
                   strokeWidth="3"
                 />
-                <text x="305" y="105" textAnchor="middle" fill="#E2E8F0" fontSize="13" fontWeight="bold">
+                <text
+                  x="305"
+                  y="105"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   Instruction Memory
                 </text>
                 <text x="305" y="125" textAnchor="middle" fill="#94A3B8" fontSize="11">
@@ -1440,7 +1381,6 @@ export default function App() {
                   IR: {currentStep?.ir ?? "0x0000"}
                 </text>
 
-                {/* BLOCK 3: Instruction Decoder & 6-State FSM */}
                 <rect
                   x="460"
                   y="70"
@@ -1451,7 +1391,14 @@ export default function App() {
                   stroke="#2563EB"
                   strokeWidth="3"
                 />
-                <text x="540" y="100" textAnchor="middle" fill="#E2E8F0" fontSize="13" fontWeight="bold">
+                <text
+                  x="540"
+                  y="100"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   Decoder & FSM
                 </text>
                 <text
@@ -1465,14 +1412,27 @@ export default function App() {
                 >
                   {currentStep?.decoded.mnemonic ?? "NOP"}
                 </text>
-                <text x="540" y="165" textAnchor="middle" fill="#94A3B8" fontSize="11" fontFamily="monospace">
+                <text
+                  x="540"
+                  y="165"
+                  textAnchor="middle"
+                  fill="#94A3B8"
+                  fontSize="11"
+                  fontFamily="monospace"
+                >
                   imm8: {currentStep?.decoded.imm8 ?? "0x00"}
                 </text>
-                <text x="540" y="190" textAnchor="middle" fill="#60A5FA" fontSize="11" fontFamily="monospace">
+                <text
+                  x="540"
+                  y="190"
+                  textAnchor="middle"
+                  fill="#60A5FA"
+                  fontSize="11"
+                  fontFamily="monospace"
+                >
                   wb_sel: {currentStep?.decoded.wb_sel ?? "--"}
                 </text>
 
-                {/* BLOCK 4: 8x8 Register File */}
                 <rect
                   x="690"
                   y="70"
@@ -1483,19 +1443,39 @@ export default function App() {
                   stroke={currentStep?.rf_we ? "#2563EB" : "#475569"}
                   strokeWidth="3"
                 />
-                <text x="770" y="100" textAnchor="middle" fill="#E2E8F0" fontSize="13" fontWeight="bold">
+                <text
+                  x="770"
+                  y="100"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   Register File (8×8)
                 </text>
-                <text x="770" y="130" textAnchor="middle" fill="#94A3B8" fontSize="12" fontFamily="monospace">
+                <text
+                  x="770"
+                  y="130"
+                  textAnchor="middle"
+                  fill="#94A3B8"
+                  fontSize="12"
+                  fontFamily="monospace"
+                >
                   Rd: R{currentStep?.decoded.rd ?? 0} | Rs1: R{currentStep?.decoded.rs1 ?? 0}
                 </text>
-                <text x="770" y="160" textAnchor="middle" fill="#60A5FA" fontSize="13" fontFamily="monospace">
+                <text
+                  x="770"
+                  y="160"
+                  textAnchor="middle"
+                  fill="#60A5FA"
+                  fontSize="13"
+                  fontFamily="monospace"
+                >
                   {currentStep?.rf_we
                     ? `WRITE R${currentStep.rd_addr} = ${currentStep.rf_data}`
                     : "rf_we = 0"}
                 </text>
 
-                {/* BLOCK 5: 8-Bit ALU & ZNCV Flags */}
                 <rect
                   x="920"
                   y="70"
@@ -1506,17 +1486,30 @@ export default function App() {
                   stroke={dpActive.isAlu ? "#2563EB" : "#475569"}
                   strokeWidth="3"
                 />
-                <text x="995" y="100" textAnchor="middle" fill="#E2E8F0" fontSize="13" fontWeight="bold">
+                <text
+                  x="995"
+                  y="100"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   8-Bit ALU
                 </text>
-                <text x="995" y="135" textAnchor="middle" fill="#38BDF8" fontSize="14" fontFamily="monospace">
+                <text
+                  x="995"
+                  y="135"
+                  textAnchor="middle"
+                  fill="#38BDF8"
+                  fontSize="14"
+                  fontFamily="monospace"
+                >
                   ZNCV: {reconstructed.flags}
                 </text>
                 <text x="995" y="170" textAnchor="middle" fill="#94A3B8" fontSize="11">
                   ADD/SUB/AND/OR/XOR
                 </text>
 
-                {/* BLOCK 6: int8 Neural Network Accelerator (0x50-0x5F) */}
                 <rect
                   x="410"
                   y="320"
@@ -1527,17 +1520,37 @@ export default function App() {
                   stroke={dpActive.isNn ? "#F59E0B" : "#475569"}
                   strokeWidth="3"
                 />
-                <text x="540" y="350" textAnchor="middle" fill="#FBBF24" fontSize="13" fontWeight="bold">
+                <text
+                  x="540"
+                  y="350"
+                  textAnchor="middle"
+                  fill="#FBBF24"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   int8 NN Accelerator (0x50–0x5F)
                 </text>
-                <text x="540" y="380" textAnchor="middle" fill="#E2E8F0" fontSize="12" fontFamily="monospace">
+                <text
+                  x="540"
+                  y="380"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="12"
+                  fontFamily="monospace"
+                >
                   ACC24: {reconstructed.nn.acc} | QOUT: {reconstructed.nn.qout}
                 </text>
-                <text x="540" y="408" textAnchor="middle" fill="#34D399" fontSize="12" fontFamily="monospace">
+                <text
+                  x="540"
+                  y="408"
+                  textAnchor="middle"
+                  fill="#34D399"
+                  fontSize="12"
+                  fontFamily="monospace"
+                >
                   LUT ACT: {reconstructed.nn.act} | MACs: {reconstructed.nn.mac_cnt}
                 </text>
 
-                {/* BLOCK 7: 256-Byte Data Memory (DMEM) */}
                 <rect
                   x="700"
                   y="320"
@@ -1548,10 +1561,24 @@ export default function App() {
                   stroke={dpActive.isMem ? "#10B981" : "#475569"}
                   strokeWidth="3"
                 />
-                <text x="795" y="350" textAnchor="middle" fill="#E2E8F0" fontSize="13" fontWeight="bold">
+                <text
+                  x="795"
+                  y="350"
+                  textAnchor="middle"
+                  fill="#E2E8F0"
+                  fontSize="13"
+                  fontWeight="bold"
+                >
                   Data Memory (256×8)
                 </text>
-                <text x="795" y="385" textAnchor="middle" fill="#34D399" fontSize="12" fontFamily="monospace">
+                <text
+                  x="795"
+                  y="385"
+                  textAnchor="middle"
+                  fill="#34D399"
+                  fontSize="12"
+                  fontFamily="monospace"
+                >
                   {currentStep?.mem_we
                     ? `ST [${currentStep.mem_addr}] ← ${currentStep.mem_data}`
                     : "mem_we = 0"}
@@ -1561,7 +1588,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: FEATURE 3 — IN-BROWSER WAVEFORM VIEWER (.VCD) */}
         {activeTab === "waveform" && (
           <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -1571,7 +1597,8 @@ export default function App() {
                   Digital Timing Diagram & VCD Waveform Viewer
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Source: <span className="font-mono text-blue-400">{effectiveWaveform.source}</span>
+                  Source:{" "}
+                  <span className="font-mono text-blue-400">{effectiveWaveform.source}</span>
                 </p>
               </div>
 
@@ -1614,7 +1641,6 @@ export default function App() {
 
             <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#090D16]">
               <div className="min-w-[800px]">
-                {/* Time Ruler Header */}
                 <div className="flex border-b border-slate-800 bg-slate-900/80 text-[10px] font-mono text-slate-400">
                   <div className="w-48 shrink-0 p-2 border-r border-slate-800 font-semibold text-slate-300">
                     Signal / Bus
@@ -1632,10 +1658,10 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Signal Rows */}
                 {effectiveWaveform.signals
                   .filter(
-                    (sig) => waveGroupFilter === "ALL" || sig.group.toUpperCase() === waveGroupFilter
+                    (sig) =>
+                      waveGroupFilter === "ALL" || sig.group.toUpperCase() === waveGroupFilter
                   )
                   .map((sig) => (
                     <div
@@ -1686,7 +1712,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 4: NN ACCELERATOR BENCHMARKS & SAMPLE INSPECTOR */}
         {activeTab === "nn" && (
           <div className="flex flex-col gap-6">
             <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl">
@@ -1735,7 +1760,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Speedup Comparison Table */}
               <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#090D16]">
                 <table className="w-full text-left text-xs font-mono">
                   <thead className="bg-slate-900 text-slate-400">
@@ -1781,7 +1805,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 5: FEATURE 5 — CUSTOM NEURAL NETWORK QUANTIZATION & ASSEMBLY WIZARD */}
         {activeTab === "wizard" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <div className="lg:col-span-5 bg-[#0F1624] border border-slate-800 rounded-2xl p-5 flex flex-col gap-4 shadow-xl">
@@ -1794,30 +1817,31 @@ export default function App() {
                 test custom quantized 4-feature Iris inputs.
               </p>
 
-              {/* 4 Quantized int8 Feature Inputs */}
               <div className="grid grid-cols-2 gap-3">
-                {["Sepal Length (X0)", "Sepal Width (X1)", "Petal Length (X2)", "Petal Width (X3)"].map(
-                  (label, idx) => (
-                    <div key={label} className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
-                      <label className="text-[11px] text-slate-400 block mb-1">{label}</label>
-                      <input
-                        type="number"
-                        min={-128}
-                        max={127}
-                        value={customFeatures[idx]}
-                        onChange={(e) => {
-                          const next = [...customFeatures];
-                          next[idx] = Number(e.target.value);
-                          setCustomFeatures(next);
-                        }}
-                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-sm text-white"
-                      />
-                    </div>
-                  )
-                )}
+                {[
+                  "Sepal Length (X0)",
+                  "Sepal Width (X1)",
+                  "Petal Length (X2)",
+                  "Petal Width (X3)",
+                ].map((label, idx) => (
+                  <div key={label} className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
+                    <label className="text-[11px] text-slate-400 block mb-1">{label}</label>
+                    <input
+                      type="number"
+                      min={-128}
+                      max={127}
+                      value={customFeatures[idx]}
+                      onChange={(e) => {
+                        const next = [...customFeatures];
+                        next[idx] = Number(e.target.value);
+                        setCustomFeatures(next);
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-sm text-white"
+                    />
+                  </div>
+                ))}
               </div>
 
-              {/* Shift1, Shift2 & Hardware LUT Bank Selectors */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="bg-[#090D16] p-3 rounded-xl border border-slate-800">
                   <label className="text-[11px] text-slate-400 block mb-1">
@@ -1897,7 +1921,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Right Side: Layer-by-Layer 24-Bit Accumulators & LUT Inspector */}
             <div className="lg:col-span-7 flex flex-col gap-5">
               {customNnResult && (
                 <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5 flex flex-col gap-4">
@@ -1955,7 +1978,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Hardware LUT Preview */}
               <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-5">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
                   Hardware Activation LUT Sample Table (Ports 0x58–0x5B)
@@ -1979,7 +2001,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 6: FEATURE 4 — AUTOMATED UNIT TEST & CONFORMANCE SUITE RUNNER */}
         {activeTab === "verify" && (
           <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -2067,7 +2088,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 7: REAL-TIME SSE TOOLCHAIN CONSOLE */}
         {activeTab === "toolchain" && (
           <div className="bg-[#0F1624] border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
