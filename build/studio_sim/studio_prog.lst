@@ -1,0 +1,14 @@
+; C:\Users\PMLS\Downloads\seventh semester\digital system design\shyshtem\DSD8-gates_of_dispair\DSD8-gates_of_dispair\build\studio_sim\studio_prog.asm -> C:\Users\PMLS\Downloads\seventh semester\digital system design\shyshtem\DSD8-gates_of_dispair\DSD8-gates_of_dispair\build\studio_sim\studio_prog.hex
+; 11 instructions, 0 labels
+;
+000: 10A5   LDI R0,165
+001: E15F   OUT 0x5F,R0
+002: 1003   LDI R0,3
+003: E152   OUT 0x52,R0
+004: 1203   LDI R1,3
+005: E350   OUT 0x50,R1
+006: 1404   LDI R2,4
+007: E551   OUT 0x51,R2
+008: E653   IN R3,0x53
+009: E702   OUT 0x02,R3
+00A: F000   HLT
