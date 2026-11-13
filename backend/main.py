@@ -456,17 +456,21 @@ def assemble_and_simulate(req: CustomAssembleRequest):
         return {"status": "error", "stage": "assembler", "log": asm_res.stderr or asm_res.stdout}
 
     # 2. Run Golden Simulator (dsd8sim_nn.py or dsd8sim.py)
-    sim_tool = "tools/dsd8sim_nn.py" if req.use_nn_sim else "tools/dsd8sim.py"
-    sim_cmd = [
-        sys.executable, sim_tool, str(hex_file),
-        "--trace", str(gold_trace),
-        "--state-out", str(state_json),
-        "--switches", req.switches,
-        "--buttons", req.buttons
-    ]
+    if req.use_nn_sim:
+        sim_cmd = [
+            sys.executable, "tools/dsd8sim_nn.py", str(hex_file),
+            "--trace", str(gold_trace),
+            "--state-out", str(state_json),
+        ]
+    else:
+        sim_cmd = [
+            sys.executable, "tools/dsd8sim.py", str(hex_file),
+            "--trace", str(gold_trace),
+            "--state-out", str(state_json),
+            "--switches", req.switches,
+            "--buttons", req.buttons,
+        ]
     sim_res = subprocess.run(sim_cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
-    if sim_res.returncode != 0:
-        return {"status": "error", "stage": "golden_sim", "log": sim_res.stderr or sim_res.stdout}
 
     # 3. Parse Golden Trace & Final State
     steps = parse_trace_file(gold_trace)
